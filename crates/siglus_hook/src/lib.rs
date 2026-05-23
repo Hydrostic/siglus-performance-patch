@@ -133,7 +133,7 @@ impl Drop for ProgramArray {
 
 impl ProgramCStr {
     fn new(value: &str) -> Option<Self> {
-        let wide: Vec<u16> = value.encode_utf16().collect();
+        let mut wide: Vec<u16> = value.encode_utf16().collect();
         let len = wide.len();
         if len > u32::MAX as usize {
             return None;
@@ -153,6 +153,7 @@ impl ProgramCStr {
             cstr.fields[4] = len as u32;
             cstr.fields[5] = 7;
         } else {
+            wide.push(0);
             cstr.heap = Some(wide);
             cstr.fields[0] = cstr.heap.as_ref()?.as_ptr() as u32;
             cstr.fields[4] = len as u32;
@@ -164,6 +165,22 @@ impl ProgramCStr {
 
     fn as_mut_ptr(&mut self) -> *mut c_void {
         self.fields.as_mut_ptr().cast()
+    }
+
+    fn debug_description(&self) -> String {
+        let len = self.fields[4];
+        let cap = self.fields[5];
+        if len <= 7 {
+            format!("inline len={len} cap={cap}")
+        } else {
+            format!(
+                "heap ptr=0x{:08X} len={} cap={} storage_u16_len={}",
+                self.fields[0],
+                len,
+                cap,
+                self.heap.as_ref().map(|heap| heap.len()).unwrap_or(0),
+            )
+        }
     }
 }
 
@@ -583,6 +600,11 @@ unsafe fn run_async_save_job(job: &AsyncSaveJob) -> bool {
             return false;
         }
     };
+    debug_log(&format!(
+        "siglus_hook: async save CSTR path={} {}",
+        job.file_path,
+        cstr.debug_description(),
+    ));
 
     debug_log(&format!(
         "siglus_hook: async repack complete packed_len=0x{:X}/{} new_save_len=0x{:X}/{}",
