@@ -35,6 +35,10 @@ type TnmPackBufferFn = unsafe extern "fastcall" fn(*const c_void) -> bool;
 
 const TNM_SAVE_TO_FILE_OFFSET: usize = 0x25DE60;
 const TNM_PACK_BUFFER_OFFSET: usize = 0x25E120;
+const ASYNC_PACK_THRESHOLD: usize = 50 * 1024;
+const SAVE_DATA_SIZE_OFFSET: usize = 0x1228;
+const SAVE_DATA_OFFSET: usize = SAVE_DATA_SIZE_OFFSET + 4;
+const TPC_ANGOU_TABLE_OFFSET: usize = 0x6567B0;
 
 static ORIGINAL_GET_FILE_ATTRIBUTES_W: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 #[allow(dead_code)]
@@ -254,10 +258,23 @@ unsafe fn tnm_save_to_file_hook_body(
     write_data: *const c_void,
 ) -> bool {
     // let file_path_raw = unsafe { dump_u32_words(file_path, 6) };
+    let file_path_text = unsafe { read_cstr(file_path) };
+    let file_name = save_file_name_from_cstr_log(&file_path_text);
+    let save_like = file_name
+        .as_deref()
+        .map(is_lower_alnum_sav_file_name)
+        .unwrap_or(false);
+    let buffer_len = unsafe { byte_array_len(write_data) };
+    let data_size = unsafe { read_u32_at(write_data, SAVE_DATA_SIZE_OFFSET) };
+    let payload_len = buffer_len.and_then(|len| len.checked_sub(SAVE_DATA_OFFSET));
     debug_log(&format!(
-        "siglus_hook: tnm_save_to_file file_path=\"{}\" write_data={}",
-        unsafe { read_cstr(file_path) },
+        "siglus_hook: tnm_save_to_file file_path=\"{}\" save_like={} write_data={} buffer_len={} payload_len_after_header={} data_size@0x1228={}",
+        file_path_text,
+        save_like,
         unsafe { dump_byte_array(write_data) },
+        format_option_usize(buffer_len),
+        format_option_usize(payload_len),
+        format_option_u32(data_size),
     ));
 
     unsafe { call_original_tnm_save_to_file(file_path, write_data) }
@@ -289,12 +306,26 @@ unsafe extern "fastcall" fn detour_tnm_pack_buffer(src: *const c_void) -> bool {
 }
 
 unsafe fn tnm_pack_buffer_hook_body(src: *const c_void) -> bool {
+    let len = unsafe { byte_array_len(src) };
+    let async_candidate = len
+        .map(|len| len > ASYNC_PACK_THRESHOLD)
+        .unwrap_or(false);
     debug_log(&format!(
-        "siglus_hook: tnm_pack_buffer src={}",
+        "siglus_hook: tnm_pack_buffer src={} raw_len={} async_candidate={}",
         unsafe { dump_byte_array(src) },
+        format_option_usize(len),
+        async_candidate,
     ));
 
-    unsafe { call_original_tnm_pack_buffer(src) }
+    let result = unsafe { call_original_tnm_pack_buffer(src) };
+    debug_log(&format!(
+        "siglus_hook: tnm_pack_buffer after result={} src={} sizes={}",
+        result,
+        unsafe { dump_byte_array(src) },
+        unsafe { dump_packed_buffer_sizes(src) },
+    ));
+
+    result
 }
 
 unsafe fn call_original_tnm_pack_buffer(src: *const c_void) -> bool {
@@ -335,15 +366,76 @@ unsafe fn dump_byte_array(value: *const c_void) -> String {
         return "<null>".to_string();
     }
 
+    match unsafe { read_byte_array_fields(value) } {
+        Some((start, end, cap_end)) => {
+            let len = end.saturating_sub(start);
+            format!(
+                "start=0x{start:08X} end=0x{end:08X} cap_end=0x{cap_end:08X} len=0x{len:X}/{len}"
+            )
+        }
+        None => "<invalid>".to_string(),
+    }
+}
+
+unsafe fn byte_array_len(value: *const c_void) -> Option<usize> {
+    let (start, end, _) = unsafe { read_byte_array_fields(value)? };
+    Some(end.saturating_sub(start))
+}
+
+unsafe fn read_byte_array_fields(value: *const c_void) -> Option<(usize, usize, usize)> {
+    if value.is_null() {
+        return None;
+    }
+
     let base = value.cast::<u8>();
     let start = unsafe { std::ptr::read_unaligned(base.cast::<usize>()) };
     let end = unsafe { std::ptr::read_unaligned(base.add(4).cast::<usize>()) };
     let cap_end = unsafe { std::ptr::read_unaligned(base.add(8).cast::<usize>()) };
-    let len = end.saturating_sub(start);
+
+    Some((start, end, cap_end))
+}
+
+unsafe fn read_u32_at(buffer: *const c_void, offset: usize) -> Option<u32> {
+    let (start, end, _) = unsafe { read_byte_array_fields(buffer)? };
+    if end.saturating_sub(start) < offset + 4 {
+        return None;
+    }
+
+    Some(unsafe { std::ptr::read_unaligned((start + offset) as *const u32) })
+}
+
+unsafe fn dump_packed_buffer_sizes(buffer: *const c_void) -> String {
+    let compressed_size = unsafe { read_decrypted_u32_at(buffer, 0) };
+    let original_size = unsafe { read_decrypted_u32_at(buffer, 4) };
 
     format!(
-        "start=0x{start:08X} end=0x{end:08X} cap_end=0x{cap_end:08X} len=0x{len:X}/{len}"
+        "decrypted_compressed_size={} decrypted_original_size={}",
+        format_option_u32(compressed_size),
+        format_option_u32(original_size),
     )
+}
+
+unsafe fn read_decrypted_u32_at(buffer: *const c_void, offset: usize) -> Option<u32> {
+    let (start, end, _) = unsafe { read_byte_array_fields(buffer)? };
+    if end.saturating_sub(start) < offset + 4 {
+        return None;
+    }
+
+    let table = unsafe { tpc_angou_table()? };
+    let mut bytes = [0u8; 4];
+    for index in 0..4 {
+        let encrypted = unsafe { *((start + offset + index) as *const u8) };
+        let key = unsafe { *table.add((offset + index) % 256) };
+        bytes[index] = encrypted ^ key;
+    }
+
+    Some(u32::from_le_bytes(bytes))
+}
+
+unsafe fn tpc_angou_table() -> Option<*const u8> {
+    unsafe { main_module_offset(TPC_ANGOU_TABLE_OFFSET) }
+        .ok()
+        .map(|address| address.cast::<u8>() as *const u8)
 }
 
 unsafe fn read_cstr(value: *const c_void) -> String {
@@ -367,6 +459,34 @@ unsafe fn read_cstr(value: *const c_void) -> String {
     };
 
     format!("{} (len={len} cap={cap})", String::from_utf16_lossy(chars))
+}
+
+fn save_file_name_from_cstr_log(value: &str) -> Option<&str> {
+    let path = value.split(" (len=").next().unwrap_or(value);
+    path.rsplit(['\\', '/']).next()
+}
+
+fn is_lower_alnum_sav_file_name(value: &str) -> bool {
+    let Some(stem) = value.strip_suffix(".sav") else {
+        return false;
+    };
+
+    !stem.is_empty()
+        && stem
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn format_option_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| format!("0x{value:X}/{value}"))
+        .unwrap_or_else(|| "<unreadable>".to_string())
+}
+
+fn format_option_u32(value: Option<u32>) -> String {
+    value
+        .map(|value| format!("0x{value:X}/{value}"))
+        .unwrap_or_else(|| "<unreadable>".to_string())
 }
 
 unsafe fn get_cached_file_attributes_w(file_name: PCWSTR) -> Option<u32> {
