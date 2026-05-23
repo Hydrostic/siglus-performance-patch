@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/siglus_hook",
+    "crates/siglus_injector",
+]
+resolver = "3"
