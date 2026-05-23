@@ -3,8 +3,8 @@
 use std::ffi::c_void;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::File;
+use std::io::BufWriter;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -33,11 +33,14 @@ type GetFileAttributesWFn = unsafe extern "system" fn(PCWSTR) -> u32;
 type CopyFileWFn = unsafe extern "system" fn(PCWSTR, PCWSTR, BOOL) -> BOOL;
 type TnmSaveToFileFn = unsafe extern "fastcall" fn(*const c_void, *const c_void) -> bool;
 type TnmPackBufferFn = unsafe extern "fastcall" fn(*const c_void) -> bool;
+type TnmCreatePngFromTextureAndSaveToFileFn =
+    unsafe extern "fastcall" fn(*const c_void, i32, i32, *const c_void, u32) -> bool;
 type ArrayAllocFn = unsafe extern "cdecl" fn(u32) -> u32;
 type ArrayReplaceStorageFn = unsafe extern "thiscall" fn(*mut c_void, u32, u32, u32) -> i32;
 
 const TNM_SAVE_TO_FILE_OFFSET: usize = 0x25DE60;
 const TNM_PACK_BUFFER_OFFSET: usize = 0x25E120;
+const TNM_CREATE_PNG_FROM_TEXTURE_AND_SAVE_TO_FILE_OFFSET: usize = 0x2389F0;
 const ARRAY_ALLOC_OFFSET: usize = 0x131C90;
 const ARRAY_REPLACE_STORAGE_OFFSET: usize = 0x1A4BB0;
 const ASYNC_PACK_THRESHOLD: usize = 50 * 1024;
@@ -59,6 +62,8 @@ static ORIGINAL_GET_FILE_ATTRIBUTES_W: AtomicPtr<c_void> = AtomicPtr::new(std::p
 static ORIGINAL_COPY_FILE_W: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static ORIGINAL_TNM_SAVE_TO_FILE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static ORIGINAL_TNM_PACK_BUFFER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static ORIGINAL_TNM_CREATE_PNG_FROM_TEXTURE_AND_SAVE_TO_FILE: AtomicPtr<c_void> =
+    AtomicPtr::new(std::ptr::null_mut());
 static GET_FILE_ATTRIBUTES_W_HITS: AtomicUsize = AtomicUsize::new(0);
 static FILE_ATTRIBUTE_CACHE: OnceLock<Arc<FileAttributeCache>> = OnceLock::new();
 static SAVE_TASKS: OnceLock<Mutex<HashMap<String, Arc<SaveSlot>>>> = OnceLock::new();
@@ -244,6 +249,18 @@ unsafe fn install_hooks() -> Result<(), MH_STATUS> {
         )?
     };
     ORIGINAL_TNM_PACK_BUFFER.store(original_tnm_pack_buffer, Ordering::Release);
+
+    let create_png = unsafe {
+        main_module_offset(TNM_CREATE_PNG_FROM_TEXTURE_AND_SAVE_TO_FILE_OFFSET)?
+    };
+    let original_create_png = unsafe {
+        MinHook::create_hook(
+            create_png,
+            detour_tnm_create_png_from_texture_and_save_to_file as *mut c_void,
+        )?
+    };
+    ORIGINAL_TNM_CREATE_PNG_FROM_TEXTURE_AND_SAVE_TO_FILE
+        .store(original_create_png, Ordering::Release);
 
     unsafe { MinHook::enable_all_hooks()? };
     Ok(())
@@ -719,6 +736,185 @@ unsafe fn call_original_tnm_pack_buffer(src: *const c_void) -> bool {
     unsafe { original(src) }
 }
 
+unsafe extern "fastcall" fn detour_tnm_create_png_from_texture_and_save_to_file(
+    file_path: *const c_void,
+    width: i32,
+    height: i32,
+    p_rect: *const c_void,
+    use_alpha: u32,
+) -> bool {
+    match catch_unwind(AssertUnwindSafe(|| unsafe {
+        tnm_create_png_from_texture_and_save_to_file_hook_body(
+            file_path,
+            width,
+            height,
+            p_rect,
+            use_alpha,
+        )
+    })) {
+        Ok(result) => result,
+        Err(_) => {
+            debug_log("siglus_hook: panic inside tnm_create_png_from_texture_and_save_to_file hook body");
+            true
+        }
+    }
+}
+
+unsafe fn tnm_create_png_from_texture_and_save_to_file_hook_body(
+    file_path: *const c_void,
+    width: i32,
+    height: i32,
+    p_rect: *const c_void,
+    use_alpha: u32,
+) -> bool {
+    let file_path_text = unsafe { read_cstr(file_path) };
+    debug_log(&format!(
+        "siglus_hook: tnm_create_png_from_texture_and_save_to_file file_path=\"{}\" width={} height={} p_rect=0x{:08X} {} use_alpha={} alpha_ignored=true",
+        file_path_text,
+        width,
+        height,
+        p_rect as usize,
+        unsafe { dump_d3d_locked_rect(p_rect) },
+        use_alpha,
+    ));
+
+    match unsafe { write_png_from_texture(file_path, width, height, p_rect) } {
+        Ok(()) => {
+            debug_log(&format!(
+                "siglus_hook: rust png write complete file_path=\"{}\"",
+                file_path_text,
+            ));
+            true
+        }
+        Err(error) => {
+            debug_log(&format!(
+                "siglus_hook: rust png write failed file_path=\"{}\" error={}",
+                file_path_text,
+                error,
+            ));
+            false
+        }
+    }
+}
+
+unsafe fn write_png_from_texture(
+    file_path: *const c_void,
+    width: i32,
+    height: i32,
+    p_rect: *const c_void,
+) -> Result<(), String> {
+    if width <= 0 || height <= 0 {
+        return Err(format!("invalid size width={width} height={height}"));
+    }
+    if p_rect.is_null() {
+        return Err("D3DLOCKED_RECT is null".to_string());
+    }
+
+    let path = unsafe { read_cstr_plain(file_path) }
+        .ok_or_else(|| "failed to read file_path CSTR".to_string())?;
+    let base = p_rect.cast::<u8>();
+    let pitch = unsafe { std::ptr::read_unaligned(base.cast::<i32>()) };
+    let bits = unsafe { std::ptr::read_unaligned(base.add(4).cast::<*const u8>()) };
+    if pitch <= 0 {
+        return Err(format!("unsupported pitch={pitch}"));
+    }
+    if bits.is_null() {
+        return Err("D3DLOCKED_RECT.pBits is null".to_string());
+    }
+
+    let width = width as usize;
+    let height = height as usize;
+    let pitch = pitch as usize;
+    let source_row_len = width
+        .checked_mul(4)
+        .ok_or_else(|| "source row length overflow".to_string())?;
+    if pitch < source_row_len {
+        return Err(format!(
+            "pitch too small pitch={} row_len={}",
+            pitch,
+            source_row_len,
+        ));
+    }
+
+    let rgb_len = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| "png buffer length overflow".to_string())?;
+    let mut rgb = Vec::with_capacity(rgb_len);
+
+    for y in 0..height {
+        let row = unsafe { bits.add(y * pitch) };
+        unsafe { append_bgra_row_as_rgb(row, width, &mut rgb) };
+    }
+
+    let file = File::create(&path)
+        .map_err(|error| format!("create {} failed: {error}", path))?;
+    let writer = BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, width as u32, height as u32);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_filter(png::FilterType::NoFilter);
+    encoder.set_compression(png::Compression::Fast);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| format!("write png header failed: {error}"))?;
+    writer
+        .write_image_data(&rgb)
+        .map_err(|error| format!("write png data failed: {error}"))?;
+
+    Ok(())
+}
+
+unsafe fn append_bgra_row_as_rgb(source: *const u8, width: usize, output: &mut Vec<u8>) {
+    let chunks = width / 4;
+    let tail = width % 4;
+    for chunk_index in 0..chunks {
+        let mut bgra = [0u8; 16];
+        unsafe {
+            std::ptr::copy_nonoverlapping(source.add(chunk_index * 16), bgra.as_mut_ptr(), 16);
+        }
+        output.extend_from_slice(&convert_shift_r(&bgra));
+    }
+
+    let tail_start = chunks * 4;
+    for pixel_index in 0..tail {
+        let pixel = unsafe { source.add((tail_start + pixel_index) * 4) };
+        unsafe {
+            output.push(*pixel.add(2));
+            output.push(*pixel.add(1));
+            output.push(*pixel);
+        }
+    }
+}
+
+fn convert_shift_r(bgra: &[u8; 16]) -> [u8; 12] {
+    let bgra = bgra.as_chunks().0;
+    let mut buffer = 0_u128;
+    for bgra in bgra.iter().cloned().rev() {
+        buffer <<= 24;
+        buffer |= u128::from(u32::from_be_bytes(bgra) >> 8);
+    }
+    buffer.to_le_bytes().as_chunks().0[0]
+}
+
+#[allow(dead_code)]
+unsafe fn call_original_tnm_create_png_from_texture_and_save_to_file(
+    file_path: *const c_void,
+    width: i32,
+    height: i32,
+    p_rect: *const c_void,
+    use_alpha: u32,
+) -> bool {
+    let original = ORIGINAL_TNM_CREATE_PNG_FROM_TEXTURE_AND_SAVE_TO_FILE.load(Ordering::Acquire);
+    if original.is_null() {
+        return false;
+    }
+
+    let original: TnmCreatePngFromTextureAndSaveToFileFn =
+        unsafe { std::mem::transmute(original) };
+    unsafe { original(file_path, width, height, p_rect, use_alpha) }
+}
+
 unsafe fn main_module_offset(offset: usize) -> Result<*mut c_void, MH_STATUS> {
     let module = unsafe { GetModuleHandleW(std::ptr::null()) };
     if module.is_null() {
@@ -841,6 +1037,18 @@ unsafe fn dump_byte_array(value: *const c_void) -> String {
         }
         None => "<invalid>".to_string(),
     }
+}
+
+unsafe fn dump_d3d_locked_rect(value: *const c_void) -> String {
+    if value.is_null() {
+        return "rect=<null>".to_string();
+    }
+
+    let base = value.cast::<u8>();
+    let pitch = unsafe { std::ptr::read_unaligned(base.cast::<i32>()) };
+    let bits = unsafe { std::ptr::read_unaligned(base.add(4).cast::<usize>()) };
+
+    format!("pitch={} pBits=0x{bits:08X}", pitch)
 }
 
 unsafe fn byte_array_len(value: *const c_void) -> Option<usize> {
@@ -1168,12 +1376,12 @@ fn file_name_key(path: &Path) -> Option<String> {
 }
 
 fn debug_log(message: &str) {
-    // let mut wide: Vec<u16> = message.encode_utf16().collect();
-    // wide.push(0);
+    let mut wide: Vec<u16> = message.encode_utf16().collect();
+    wide.push(0);
 
-    // unsafe {
-    //     OutputDebugStringW(wide.as_ptr());
-    // }
+    unsafe {
+        OutputDebugStringW(wide.as_ptr());
+    }
 
     // let mut log_path = std::env::temp_dir();
     // log_path.push("siglus_hook.log");
