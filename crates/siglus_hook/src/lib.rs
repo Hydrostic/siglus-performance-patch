@@ -40,8 +40,14 @@ const TNM_PACK_BUFFER_OFFSET: usize = 0x25E120;
 const ARRAY_ALLOC_OFFSET: usize = 0x131C90;
 const ARRAY_REPLACE_STORAGE_OFFSET: usize = 0x1A4BB0;
 const ASYNC_PACK_THRESHOLD: usize = 50 * 1024;
-const SAVE_DATA_SIZE_OFFSET: usize = 0x1228;
-const SAVE_DATA_OFFSET: usize = SAVE_DATA_SIZE_OFFSET + 4;
+const NORMAL_SAVE_DATA_SIZE_OFFSET: usize = 0x1228;
+const NORMAL_SAVE_DATA_OFFSET: usize = NORMAL_SAVE_DATA_SIZE_OFFSET + 4;
+const READ_SAVE_DATA_SIZE_OFFSET: usize = 0x8;
+const READ_SAVE_DATA_OFFSET: usize = 0x10;
+const CONFIG_SAVE_DATA_SIZE_OFFSET: usize = 0x8;
+const CONFIG_SAVE_DATA_OFFSET: usize = 0xC;
+const GLOBAL_SAVE_DATA_SIZE_OFFSET: usize = 0x8;
+const GLOBAL_SAVE_DATA_OFFSET: usize = 0xC;
 const TPC_ANGOU_TABLE_OFFSET: usize = 0x6567B0;
 const PLACEHOLDER_MAGIC: &[u8; 4] = b"SPP0";
 const PLACEHOLDER_HEADER_SIZE: usize = 16;
@@ -72,6 +78,13 @@ enum AttributeLookupResult {
     Hit(u32),
     MissingInG00,
     ParentNotG00,
+}
+
+#[derive(Clone, Copy)]
+struct SaveLayout {
+    kind: &'static str,
+    data_size_offset: usize,
+    data_offset: usize,
 }
 
 struct ProgramArray {
@@ -285,25 +298,25 @@ unsafe fn tnm_save_to_file_hook_body(
     // let file_path_raw = unsafe { dump_u32_words(file_path, 6) };
     let file_path_text = unsafe { read_cstr(file_path) };
     let file_name = save_file_name_from_cstr_log(&file_path_text);
-    let save_like = file_name
-        .as_deref()
-        .map(is_lower_alnum_sav_file_name)
-        .unwrap_or(false);
+    let save_layout = file_name.as_deref().and_then(save_layout_for_file_name);
     let buffer_len = unsafe { byte_array_len(write_data) };
-    let data_size = unsafe { read_u32_at(write_data, SAVE_DATA_SIZE_OFFSET) };
-    let payload_len = buffer_len.and_then(|len| len.checked_sub(SAVE_DATA_OFFSET));
+    let data_size = save_layout.and_then(|layout| unsafe {
+        read_u32_at(write_data, layout.data_size_offset)
+    });
+    let payload_len = save_layout
+        .and_then(|layout| buffer_len.and_then(|len| len.checked_sub(layout.data_offset)));
     debug_log(&format!(
-        "siglus_hook: tnm_save_to_file file_path=\"{}\" save_like={} write_data={} buffer_len={} payload_len_after_header={} data_size@0x1228={}",
+        "siglus_hook: tnm_save_to_file file_path=\"{}\" save_kind={} write_data={} buffer_len={} payload_len_after_header={} data_size={}",
         file_path_text,
-        save_like,
+        save_layout.map(|layout| layout.kind).unwrap_or("not-sav"),
         unsafe { dump_byte_array(write_data) },
         format_option_usize(buffer_len),
         format_option_usize(payload_len),
         format_option_u32(data_size),
     ));
 
-    if save_like {
-        if let Some(result) = unsafe { try_save_placeholder_sync(file_path, write_data as *mut c_void) } {
+    if let Some(layout) = save_layout {
+        if let Some(result) = unsafe { try_save_placeholder_sync(file_path, write_data as *mut c_void, layout) } {
             return result;
         }
     }
@@ -327,14 +340,15 @@ unsafe fn call_original_tnm_save_to_file(
 unsafe fn try_save_placeholder_sync(
     file_path: *const c_void,
     write_data: *mut c_void,
+    layout: SaveLayout,
 ) -> Option<bool> {
     let (save_start, save_end, _) = unsafe { read_byte_array_fields(write_data)? };
     let save_len = save_end.checked_sub(save_start)?;
-    if save_len < SAVE_DATA_OFFSET + PLACEHOLDER_HEADER_SIZE {
+    if save_len < layout.data_offset + PLACEHOLDER_HEADER_SIZE {
         return None;
     }
 
-    let data_start = SAVE_DATA_OFFSET;
+    let data_start = layout.data_offset;
     let data_ptr = (save_start + data_start) as *const u8;
     let magic = unsafe { std::slice::from_raw_parts(data_ptr, PLACEHOLDER_MAGIC.len()) };
     if magic != PLACEHOLDER_MAGIC {
@@ -362,7 +376,8 @@ unsafe fn try_save_placeholder_sync(
     }
 
     debug_log(&format!(
-        "siglus_hook: placeholder detected; sync repack raw_len=0x{raw_len:X}/{raw_len}"
+        "siglus_hook: placeholder detected; sync repack kind={} raw_len=0x{raw_len:X}/{raw_len}",
+        layout.kind,
     ));
 
     let raw_ptr = (save_start + raw_start) as *const u8;
@@ -387,8 +402,9 @@ unsafe fn try_save_placeholder_sync(
         }
     };
     let packed_len = packed_end.checked_sub(packed_start)?;
-    let new_save_len = SAVE_DATA_OFFSET.checked_add(packed_len)?;
-    if !unsafe { replace_save_buffer(write_data, save_start as *const u8, packed_start as *const u8, packed_len, new_save_len) } {
+    let new_save_len = layout.data_offset.checked_add(packed_len)?;
+
+    if !unsafe { replace_save_buffer(write_data, save_start as *const u8, packed_start as *const u8, packed_len, new_save_len, layout) } {
         debug_log("siglus_hook: failed to replace save buffer after sync repack");
         return None;
     }
@@ -595,6 +611,7 @@ unsafe fn replace_save_buffer(
     packed_start: *const u8,
     packed_len: usize,
     new_save_len: usize,
+    layout: SaveLayout,
 ) -> bool {
     if old_save_start.is_null() || packed_start.is_null() {
         return false;
@@ -605,10 +622,10 @@ unsafe fn replace_save_buffer(
     };
 
     unsafe {
-        std::ptr::copy_nonoverlapping(old_save_start, new_start, SAVE_DATA_OFFSET);
-        std::ptr::copy_nonoverlapping(packed_start, new_start.add(SAVE_DATA_OFFSET), packed_len);
+        std::ptr::copy_nonoverlapping(old_save_start, new_start, layout.data_offset);
+        std::ptr::copy_nonoverlapping(packed_start, new_start.add(layout.data_offset), packed_len);
         std::ptr::write_unaligned(
-            new_start.add(SAVE_DATA_SIZE_OFFSET).cast::<u32>(),
+            new_start.add(layout.data_size_offset).cast::<u32>(),
             packed_len as u32,
         );
         array_replace_storage(
@@ -748,15 +765,37 @@ fn save_file_name_from_cstr_log(value: &str) -> Option<&str> {
     path.rsplit(['\\', '/']).next()
 }
 
-fn is_lower_alnum_sav_file_name(value: &str) -> bool {
-    let Some(stem) = value.strip_suffix(".sav") else {
-        return false;
-    };
-
-    !stem.is_empty()
-        && stem
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+fn save_layout_for_file_name(value: &str) -> Option<SaveLayout> {
+    let value = value.to_ascii_lowercase();
+    match value.as_str() {
+        "read.sav" => Some(SaveLayout {
+            kind: "read",
+            data_size_offset: READ_SAVE_DATA_SIZE_OFFSET,
+            data_offset: READ_SAVE_DATA_OFFSET,
+        }),
+        "config.sav" => Some(SaveLayout {
+            kind: "config",
+            data_size_offset: CONFIG_SAVE_DATA_SIZE_OFFSET,
+            data_offset: CONFIG_SAVE_DATA_OFFSET,
+        }),
+        "global.sav" => Some(SaveLayout {
+            kind: "global",
+            data_size_offset: GLOBAL_SAVE_DATA_SIZE_OFFSET,
+            data_offset: GLOBAL_SAVE_DATA_OFFSET,
+        }),
+        _ => {
+            let stem = value.strip_suffix(".sav")?;
+            if !stem.is_empty() && stem.bytes().all(|byte| byte.is_ascii_digit()) {
+                Some(SaveLayout {
+                    kind: "normal",
+                    data_size_offset: NORMAL_SAVE_DATA_SIZE_OFFSET,
+                    data_offset: NORMAL_SAVE_DATA_OFFSET,
+                })
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn format_option_usize(value: Option<usize>) -> String {
