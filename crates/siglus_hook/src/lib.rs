@@ -18,7 +18,8 @@ use windows_sys::Win32::Foundation::{
 };
 #[allow(unused_imports)]
 use windows_sys::Win32::Storage::FileSystem::{
-    CopyFileW, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+    CopyFileW, GetFileAttributesW, MoveFileExW, MoveFileW, INVALID_FILE_ATTRIBUTES,
+    MOVEFILE_REPLACE_EXISTING,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows_sys::Win32::System::LibraryLoader::{
@@ -29,7 +30,6 @@ use windows_sys::Win32::System::Threading::CreateThread;
 use windows_sys::core::PCWSTR;
 
 type GetFileAttributesWFn = unsafe extern "system" fn(PCWSTR) -> u32;
-#[allow(dead_code)]
 type CopyFileWFn = unsafe extern "system" fn(PCWSTR, PCWSTR, BOOL) -> BOOL;
 type TnmSaveToFileFn = unsafe extern "fastcall" fn(*const c_void, *const c_void) -> bool;
 type TnmPackBufferFn = unsafe extern "fastcall" fn(*const c_void) -> bool;
@@ -58,7 +58,6 @@ const PLACEHOLDER_HEADER_SIZE: usize = 16;
 const PLACEHOLDER_VERSION: u32 = 1;
 
 static ORIGINAL_GET_FILE_ATTRIBUTES_W: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-#[allow(dead_code)]
 static ORIGINAL_COPY_FILE_W: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static ORIGINAL_TNM_SAVE_TO_FILE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static ORIGINAL_TNM_PACK_BUFFER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -241,13 +240,13 @@ unsafe fn install_hooks() -> Result<(), MH_STATUS> {
     };
     ORIGINAL_GET_FILE_ATTRIBUTES_W.store(original_get_file_attributes_w, Ordering::Release);
 
-    // let original_copy_file_w = unsafe {
-    //     MinHook::create_hook(
-    //         CopyFileW as *mut c_void,
-    //         detour_copy_file_w as *mut c_void,
-    //     )?
-    // };
-    // ORIGINAL_COPY_FILE_W.store(original_copy_file_w, Ordering::Release);
+    let original_copy_file_w = unsafe {
+        MinHook::create_hook(
+            CopyFileW as *mut c_void,
+            detour_copy_file_w as *mut c_void,
+        )?
+    };
+    ORIGINAL_COPY_FILE_W.store(original_copy_file_w, Ordering::Release);
 
     let tnm_save_to_file = unsafe { main_module_offset(TNM_SAVE_TO_FILE_OFFSET)? };
     let original_tnm_save_to_file = unsafe {
@@ -318,7 +317,6 @@ unsafe fn call_original_get_file_attributes_w(file_name: PCWSTR) -> u32 {
     unsafe { original(file_name) }
 }
 
-#[allow(dead_code)]
 unsafe extern "system" fn detour_copy_file_w(
     existing_file_name: PCWSTR,
     new_file_name: PCWSTR,
@@ -335,21 +333,41 @@ unsafe extern "system" fn detour_copy_file_w(
     }
 }
 
-#[allow(dead_code)]
 unsafe fn copy_file_w_hook_body(
     existing_file_name: PCWSTR,
     new_file_name: PCWSTR,
     fail_if_exists: BOOL,
 ) -> BOOL {
+    let existing = unsafe { pcwstr_to_log_string(existing_file_name) };
+    let new = unsafe { pcwstr_to_log_string(new_file_name) };
     debug_log(&format!(
         "siglus_hook: CopyFileW existing=\"{}\" new=\"{}\" fail_if_exists={}",
-        unsafe { pcwstr_to_log_string(existing_file_name) },
-        unsafe { pcwstr_to_log_string(new_file_name) },
+        existing,
+        new,
         fail_if_exists,
     ));
 
-    // unsafe { call_original_copy_file_w(existing_file_name, new_file_name, fail_if_exists) }
-    TRUE
+    if should_move_rotated_save_or_png(&existing, &new) {
+        if fail_if_exists == 0 {
+            debug_log(&format!(
+                "siglus_hook: CopyFileW rewritten to MoveFileExW(REPLACE_EXISTING) existing=\"{}\" new=\"{}\"",
+                existing,
+                new,
+            ));
+            return unsafe {
+                MoveFileExW(existing_file_name, new_file_name, MOVEFILE_REPLACE_EXISTING)
+            };
+        } else {
+            debug_log(&format!(
+                "siglus_hook: CopyFileW rewritten to MoveFileW existing=\"{}\" new=\"{}\"",
+                existing,
+                new,
+            ));
+            return unsafe { MoveFileW(existing_file_name, new_file_name) };
+        }
+    }
+
+    unsafe { call_original_copy_file_w(existing_file_name, new_file_name, fail_if_exists) }
 }
 
 #[allow(dead_code)]
@@ -365,6 +383,43 @@ unsafe fn call_original_copy_file_w(
 
     let original: CopyFileWFn = unsafe { std::mem::transmute(original) };
     unsafe { original(existing_file_name, new_file_name, fail_if_exists) }
+}
+
+fn should_move_rotated_save_or_png(existing: &str, new: &str) -> bool {
+    let Some(existing) = numbered_sav_or_png_file(existing) else {
+        return false;
+    };
+    let Some(new) = numbered_sav_or_png_file(new) else {
+        return false;
+    };
+
+    existing.extension == new.extension
+        && existing.number.checked_add(1) == Some(new.number)
+        && (1001..=1009).contains(&new.number)
+}
+
+struct NumberedSavOrPngFile<'a> {
+    number: u32,
+    extension: &'a str,
+}
+
+fn numbered_sav_or_png_file(path: &str) -> Option<NumberedSavOrPngFile<'_>> {
+    let file_name = path.rsplit(['\\', '/']).next()?;
+    let (stem, extension) = file_name.rsplit_once('.')?;
+    if stem.is_empty() || !stem.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    let extension = if extension.eq_ignore_ascii_case("sav") {
+        "sav"
+    } else if extension.eq_ignore_ascii_case("png") {
+        "png"
+    } else {
+        return None;
+    };
+
+    let number = stem.parse().ok()?;
+    Some(NumberedSavOrPngFile { number, extension })
 }
 
 unsafe extern "fastcall" fn detour_tnm_save_to_file(
