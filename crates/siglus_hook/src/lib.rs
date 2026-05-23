@@ -32,13 +32,20 @@ type GetFileAttributesWFn = unsafe extern "system" fn(PCWSTR) -> u32;
 type CopyFileWFn = unsafe extern "system" fn(PCWSTR, PCWSTR, BOOL) -> BOOL;
 type TnmSaveToFileFn = unsafe extern "fastcall" fn(*const c_void, *const c_void) -> bool;
 type TnmPackBufferFn = unsafe extern "fastcall" fn(*const c_void) -> bool;
+type ArrayAllocFn = unsafe extern "cdecl" fn(u32) -> u32;
+type ArrayReplaceStorageFn = unsafe extern "thiscall" fn(*mut c_void, u32, u32, u32) -> i32;
 
 const TNM_SAVE_TO_FILE_OFFSET: usize = 0x25DE60;
 const TNM_PACK_BUFFER_OFFSET: usize = 0x25E120;
+const ARRAY_ALLOC_OFFSET: usize = 0x131C90;
+const ARRAY_REPLACE_STORAGE_OFFSET: usize = 0x1A4BB0;
 const ASYNC_PACK_THRESHOLD: usize = 50 * 1024;
 const SAVE_DATA_SIZE_OFFSET: usize = 0x1228;
 const SAVE_DATA_OFFSET: usize = SAVE_DATA_SIZE_OFFSET + 4;
 const TPC_ANGOU_TABLE_OFFSET: usize = 0x6567B0;
+const PLACEHOLDER_MAGIC: &[u8; 4] = b"SPP0";
+const PLACEHOLDER_HEADER_SIZE: usize = 16;
+const PLACEHOLDER_VERSION: u32 = 1;
 
 static ORIGINAL_GET_FILE_ATTRIBUTES_W: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 #[allow(dead_code)]
@@ -65,6 +72,24 @@ enum AttributeLookupResult {
     Hit(u32),
     MissingInG00,
     ParentNotG00,
+}
+
+struct ProgramArray {
+    fields: [u32; 3],
+}
+
+impl ProgramArray {
+    fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.fields.as_mut_ptr().cast()
+    }
+}
+
+impl Drop for ProgramArray {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = array_replace_storage(self.as_mut_ptr(), 0, 0, 0);
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -277,6 +302,12 @@ unsafe fn tnm_save_to_file_hook_body(
         format_option_u32(data_size),
     ));
 
+    if save_like {
+        if let Some(result) = unsafe { try_save_placeholder_sync(file_path, write_data as *mut c_void) } {
+            return result;
+        }
+    }
+
     unsafe { call_original_tnm_save_to_file(file_path, write_data) }
 }
 
@@ -291,6 +322,86 @@ unsafe fn call_original_tnm_save_to_file(
 
     let original: TnmSaveToFileFn = unsafe { std::mem::transmute(original) };
     unsafe { original(file_path, write_data) }
+}
+
+unsafe fn try_save_placeholder_sync(
+    file_path: *const c_void,
+    write_data: *mut c_void,
+) -> Option<bool> {
+    let (save_start, save_end, _) = unsafe { read_byte_array_fields(write_data)? };
+    let save_len = save_end.checked_sub(save_start)?;
+    if save_len < SAVE_DATA_OFFSET + PLACEHOLDER_HEADER_SIZE {
+        return None;
+    }
+
+    let data_start = SAVE_DATA_OFFSET;
+    let data_ptr = (save_start + data_start) as *const u8;
+    let magic = unsafe { std::slice::from_raw_parts(data_ptr, PLACEHOLDER_MAGIC.len()) };
+    if magic != PLACEHOLDER_MAGIC {
+        return None;
+    }
+
+    let raw_len = unsafe { std::ptr::read_unaligned(data_ptr.add(4).cast::<u32>()) } as usize;
+    let version = unsafe { std::ptr::read_unaligned(data_ptr.add(8).cast::<u32>()) };
+    if version != PLACEHOLDER_VERSION {
+        debug_log(&format!(
+            "siglus_hook: placeholder version mismatch version={version}"
+        ));
+        return None;
+    }
+
+    let raw_start = data_start + PLACEHOLDER_HEADER_SIZE;
+    let raw_end = raw_start.checked_add(raw_len)?;
+    if raw_end > save_len {
+        debug_log(&format!(
+            "siglus_hook: placeholder raw range invalid raw_len={} save_len={}",
+            raw_len,
+            save_len,
+        ));
+        return None;
+    }
+
+    debug_log(&format!(
+        "siglus_hook: placeholder detected; sync repack raw_len=0x{raw_len:X}/{raw_len}"
+    ));
+
+    let raw_ptr = (save_start + raw_start) as *const u8;
+    let mut temp = match unsafe { program_array_from_raw(raw_ptr, raw_len) } {
+        Some(temp) => temp,
+        None => {
+            debug_log("siglus_hook: failed to allocate temp array for sync repack");
+            return None;
+        }
+    };
+
+    if !unsafe { call_original_tnm_pack_buffer(temp.as_mut_ptr()) } {
+        debug_log("siglus_hook: original tnm_pack_buffer failed during sync repack");
+        return None;
+    }
+
+    let (packed_start, packed_end, _) = match unsafe { read_byte_array_fields(temp.as_mut_ptr()) } {
+        Some(fields) => fields,
+        None => {
+            debug_log("siglus_hook: failed to read packed temp array fields");
+            return None;
+        }
+    };
+    let packed_len = packed_end.checked_sub(packed_start)?;
+    let new_save_len = SAVE_DATA_OFFSET.checked_add(packed_len)?;
+    if !unsafe { replace_save_buffer(write_data, save_start as *const u8, packed_start as *const u8, packed_len, new_save_len) } {
+        debug_log("siglus_hook: failed to replace save buffer after sync repack");
+        return None;
+    }
+
+    debug_log(&format!(
+        "siglus_hook: sync repack complete packed_len=0x{:X}/{} new_save_len=0x{:X}/{}",
+        packed_len,
+        packed_len,
+        new_save_len,
+        new_save_len,
+    ));
+
+    Some(unsafe { call_original_tnm_save_to_file(file_path, write_data) })
 }
 
 unsafe extern "fastcall" fn detour_tnm_pack_buffer(src: *const c_void) -> bool {
@@ -317,6 +428,18 @@ unsafe fn tnm_pack_buffer_hook_body(src: *const c_void) -> bool {
         async_candidate,
     ));
 
+    if async_candidate {
+        if unsafe { write_placeholder_pack_buffer(src as *mut c_void) } {
+            debug_log(&format!(
+                "siglus_hook: tnm_pack_buffer placeholder applied raw_len={}",
+                format_option_usize(len),
+            ));
+            return true;
+        }
+
+        debug_log("siglus_hook: tnm_pack_buffer placeholder failed; falling back to original");
+    }
+
     let result = unsafe { call_original_tnm_pack_buffer(src) };
     debug_log(&format!(
         "siglus_hook: tnm_pack_buffer after result={} src={} sizes={}",
@@ -326,6 +449,47 @@ unsafe fn tnm_pack_buffer_hook_body(src: *const c_void) -> bool {
     ));
 
     result
+}
+
+unsafe fn write_placeholder_pack_buffer(src: *mut c_void) -> bool {
+    let Some((raw_start, raw_end, _)) = (unsafe { read_byte_array_fields(src) }) else {
+        return false;
+    };
+
+    let Some(raw_len) = raw_end.checked_sub(raw_start) else {
+        return false;
+    };
+
+    let Some(placeholder_len) = raw_len.checked_add(PLACEHOLDER_HEADER_SIZE) else {
+        return false;
+    };
+
+    let Some(new_start) = (unsafe { array_alloc(placeholder_len) }) else {
+        return false;
+    };
+
+    let mut header = [0u8; PLACEHOLDER_HEADER_SIZE];
+    header[0..4].copy_from_slice(PLACEHOLDER_MAGIC);
+    header[4..8].copy_from_slice(&(raw_len as u32).to_le_bytes());
+    header[8..12].copy_from_slice(&PLACEHOLDER_VERSION.to_le_bytes());
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(header.as_ptr(), new_start, header.len());
+        std::ptr::copy_nonoverlapping(
+            raw_start as *const u8,
+            new_start.add(PLACEHOLDER_HEADER_SIZE),
+            raw_len,
+        );
+
+        array_replace_storage(
+            src,
+            new_start as u32,
+            placeholder_len as u32,
+            placeholder_len as u32,
+        );
+    }
+
+    true
 }
 
 unsafe fn call_original_tnm_pack_buffer(src: *const c_void) -> bool {
@@ -345,6 +509,124 @@ unsafe fn main_module_offset(offset: usize) -> Result<*mut c_void, MH_STATUS> {
     }
 
     Ok((module as usize + offset) as *mut c_void)
+}
+
+unsafe fn array_alloc(size: usize) -> Option<*mut u8> {
+    let alloc = unsafe { main_module_offset(ARRAY_ALLOC_OFFSET).ok()? };
+    let alloc: ArrayAllocFn = unsafe { std::mem::transmute(alloc) };
+    let ptr = unsafe { alloc(size.try_into().ok()?) };
+    if ptr == 0 {
+        None
+    } else {
+        Some(ptr as *mut u8)
+    }
+}
+
+unsafe fn array_replace_storage(
+    array: *mut c_void,
+    start: u32,
+    size: u32,
+    capacity: u32,
+) -> i32 {
+    let replace = unsafe { main_module_offset(ARRAY_REPLACE_STORAGE_OFFSET) }
+        .expect("main module must exist for array replace storage");
+    let replace: ArrayReplaceStorageFn = unsafe { std::mem::transmute(replace) };
+    unsafe { replace(array, start, size, capacity) }
+}
+
+#[allow(dead_code)]
+unsafe fn set_program_array_bytes(array: *mut c_void, bytes: &[u8]) -> bool {
+    let Some(start) = (unsafe { array_alloc(bytes.len()) }) else {
+        return false;
+    };
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), start, bytes.len());
+        array_replace_storage(
+            array,
+            start as u32,
+            bytes.len() as u32,
+            bytes.len() as u32,
+        );
+    }
+
+    true
+}
+
+unsafe fn set_program_array_from_raw(array: *mut c_void, source: *const u8, len: usize) -> bool {
+    if source.is_null() {
+        return false;
+    }
+
+    let Some(start) = (unsafe { array_alloc(len) }) else {
+        return false;
+    };
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(source, start, len);
+        array_replace_storage(array, start as u32, len as u32, len as u32);
+    }
+
+    true
+}
+
+#[allow(dead_code)]
+unsafe fn program_array_from_bytes(bytes: &[u8]) -> Option<ProgramArray> {
+    let mut array = ProgramArray { fields: [0; 3] };
+    if unsafe { set_program_array_bytes(array.as_mut_ptr(), bytes) } {
+        Some(array)
+    } else {
+        None
+    }
+}
+
+unsafe fn program_array_from_raw(source: *const u8, len: usize) -> Option<ProgramArray> {
+    let mut array = ProgramArray { fields: [0; 3] };
+    if unsafe { set_program_array_from_raw(array.as_mut_ptr(), source, len) } {
+        Some(array)
+    } else {
+        None
+    }
+}
+
+unsafe fn replace_save_buffer(
+    write_data: *mut c_void,
+    old_save_start: *const u8,
+    packed_start: *const u8,
+    packed_len: usize,
+    new_save_len: usize,
+) -> bool {
+    if old_save_start.is_null() || packed_start.is_null() {
+        return false;
+    }
+
+    let Some(new_start) = (unsafe { array_alloc(new_save_len) }) else {
+        return false;
+    };
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(old_save_start, new_start, SAVE_DATA_OFFSET);
+        std::ptr::copy_nonoverlapping(packed_start, new_start.add(SAVE_DATA_OFFSET), packed_len);
+        std::ptr::write_unaligned(
+            new_start.add(SAVE_DATA_SIZE_OFFSET).cast::<u32>(),
+            packed_len as u32,
+        );
+        array_replace_storage(
+            write_data,
+            new_start as u32,
+            new_save_len as u32,
+            new_save_len as u32,
+        );
+    }
+
+    true
+}
+
+#[allow(dead_code)]
+unsafe fn read_array_bytes(array: *const c_void) -> Option<Vec<u8>> {
+    let (start, end, _) = unsafe { read_byte_array_fields(array)? };
+    let len = end.checked_sub(start)?;
+    Some(unsafe { std::slice::from_raw_parts(start as *const u8, len) }.to_vec())
 }
 
 #[allow(dead_code)]
