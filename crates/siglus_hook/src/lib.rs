@@ -8,8 +8,9 @@ use std::io::Write;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::thread;
 
 use minhook::{MinHook, MH_STATUS};
 use windows_sys::Win32::Foundation::{
@@ -60,9 +61,11 @@ static ORIGINAL_TNM_SAVE_TO_FILE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::n
 static ORIGINAL_TNM_PACK_BUFFER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static GET_FILE_ATTRIBUTES_W_HITS: AtomicUsize = AtomicUsize::new(0);
 static FILE_ATTRIBUTE_CACHE: OnceLock<Arc<FileAttributeCache>> = OnceLock::new();
+static SAVE_TASKS: OnceLock<Mutex<HashMap<String, Arc<SaveSlot>>>> = OnceLock::new();
 
 thread_local! {
     static THREAD_FILE_ATTRIBUTE_CACHE: RefCell<Option<Arc<FileAttributeCache>>> = RefCell::new(None);
+    static IN_ASYNC_SAVE_WORKER: RefCell<bool> = RefCell::new(false);
 }
 
 struct FileAttributeCache {
@@ -87,6 +90,24 @@ struct SaveLayout {
     data_offset: usize,
 }
 
+struct SaveSlot {
+    completed: Mutex<bool>,
+    completed_cv: Condvar,
+}
+
+struct AsyncSaveJob {
+    path_key: String,
+    file_path: String,
+    layout: SaveLayout,
+    header: Vec<u8>,
+    raw: Vec<u8>,
+}
+
+struct ProgramCStr {
+    fields: [u32; 6],
+    heap: Option<Vec<u16>>,
+}
+
 struct ProgramArray {
     fields: [u32; 3],
 }
@@ -102,6 +123,42 @@ impl Drop for ProgramArray {
         unsafe {
             let _ = array_replace_storage(self.as_mut_ptr(), 0, 0, 0);
         }
+    }
+}
+
+impl ProgramCStr {
+    fn new(value: &str) -> Option<Self> {
+        let wide: Vec<u16> = value.encode_utf16().collect();
+        let len = wide.len();
+        if len > u32::MAX as usize {
+            return None;
+        }
+
+        let mut cstr = Self {
+            fields: [0; 6],
+            heap: None,
+        };
+
+        if len <= 7 {
+            for (index, ch) in wide.iter().copied().enumerate() {
+                let field = index / 2;
+                let shift = (index % 2) * 16;
+                cstr.fields[field] |= (ch as u32) << shift;
+            }
+            cstr.fields[4] = len as u32;
+            cstr.fields[5] = 7;
+        } else {
+            cstr.heap = Some(wide);
+            cstr.fields[0] = cstr.heap.as_ref()?.as_ptr() as u32;
+            cstr.fields[4] = len as u32;
+            cstr.fields[5] = len as u32;
+        }
+
+        Some(cstr)
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.fields.as_mut_ptr().cast()
     }
 }
 
@@ -295,6 +352,10 @@ unsafe fn tnm_save_to_file_hook_body(
     file_path: *const c_void,
     write_data: *const c_void,
 ) -> bool {
+    if IN_ASYNC_SAVE_WORKER.with(|flag| *flag.borrow()) {
+        return unsafe { call_original_tnm_save_to_file(file_path, write_data) };
+    }
+
     // let file_path_raw = unsafe { dump_u32_words(file_path, 6) };
     let file_path_text = unsafe { read_cstr(file_path) };
     let file_name = save_file_name_from_cstr_log(&file_path_text);
@@ -316,7 +377,7 @@ unsafe fn tnm_save_to_file_hook_body(
     ));
 
     if let Some(layout) = save_layout {
-        if let Some(result) = unsafe { try_save_placeholder_sync(file_path, write_data as *mut c_void, layout) } {
+        if let Some(result) = unsafe { try_queue_placeholder_save(file_path, write_data as *mut c_void, layout) } {
             return result;
         }
     }
@@ -337,7 +398,7 @@ unsafe fn call_original_tnm_save_to_file(
     unsafe { original(file_path, write_data) }
 }
 
-unsafe fn try_save_placeholder_sync(
+unsafe fn try_queue_placeholder_save(
     file_path: *const c_void,
     write_data: *mut c_void,
     layout: SaveLayout,
@@ -375,49 +436,189 @@ unsafe fn try_save_placeholder_sync(
         return None;
     }
 
+    let raw_ptr = (save_start + raw_start) as *const u8;
+    let path = unsafe { read_cstr_plain(file_path)? };
+    let header = unsafe { std::slice::from_raw_parts(save_start as *const u8, layout.data_offset) }.to_vec();
+    let raw = unsafe { std::slice::from_raw_parts(raw_ptr, raw_len) }.to_vec();
     debug_log(&format!(
-        "siglus_hook: placeholder detected; sync repack kind={} raw_len=0x{raw_len:X}/{raw_len}",
+        "siglus_hook: placeholder detected; queue async save kind={} path={} raw_len=0x{raw_len:X}/{raw_len}",
         layout.kind,
+        path,
     ));
 
-    let raw_ptr = (save_start + raw_start) as *const u8;
-    let mut temp = match unsafe { program_array_from_raw(raw_ptr, raw_len) } {
+    queue_async_save(AsyncSaveJob {
+        path_key: path.to_ascii_lowercase(),
+        file_path: path,
+        layout,
+        header,
+        raw,
+    });
+    Some(true)
+}
+
+fn queue_async_save(job: AsyncSaveJob) {
+    let tasks = SAVE_TASKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let slot = Arc::new(SaveSlot {
+        completed: Mutex::new(false),
+        completed_cv: Condvar::new(),
+    });
+
+    let previous = {
+        let mut tasks = tasks.lock().unwrap();
+        tasks.insert(job.path_key.clone(), Arc::clone(&slot))
+    };
+
+    if let Some(previous) = previous {
+        debug_log(&format!(
+            "siglus_hook: waiting previous async save path={}",
+            job.file_path,
+        ));
+        let mut completed = previous.completed.lock().unwrap();
+        while !*completed {
+            completed = previous.completed_cv.wait(completed).unwrap();
+        }
+    }
+
+    debug_log(&format!(
+        "siglus_hook: async save queued path={} kind={} raw_len=0x{:X}/{}",
+        job.file_path,
+        job.layout.kind,
+        job.raw.len(),
+        job.raw.len(),
+    ));
+
+    let path_key = job.path_key.clone();
+    thread::spawn(move || {
+        let result = catch_unwind(AssertUnwindSafe(|| unsafe { run_async_save_job(&job) }));
+        match result {
+            Ok(true) => debug_log(&format!("siglus_hook: async save complete path={}", job.file_path)),
+            Ok(false) => debug_log(&format!("siglus_hook: async save failed path={}", job.file_path)),
+            Err(_) => debug_log(&format!("siglus_hook: panic in async save path={}", job.file_path)),
+        }
+
+        if let Some(tasks) = SAVE_TASKS.get() {
+            let mut tasks = tasks.lock().unwrap();
+            if let Some(current) = tasks.get(&path_key) {
+                if Arc::ptr_eq(current, &slot) {
+                    tasks.remove(&path_key);
+                }
+            }
+        }
+
+        let mut completed = slot.completed.lock().unwrap();
+        *completed = true;
+        slot.completed_cv.notify_all();
+    });
+}
+
+unsafe fn run_async_save_job(job: &AsyncSaveJob) -> bool {
+    debug_log(&format!("siglus_hook: async worker start path={}", job.file_path));
+
+    let mut temp = match unsafe { program_array_from_raw(job.raw.as_ptr(), job.raw.len()) } {
         Some(temp) => temp,
         None => {
-            debug_log("siglus_hook: failed to allocate temp array for sync repack");
-            return None;
+            debug_log("siglus_hook: failed to allocate temp array for async repack");
+            return false;
         }
     };
 
+    debug_log("siglus_hook: async pack start");
     if !unsafe { call_original_tnm_pack_buffer(temp.as_mut_ptr()) } {
-        debug_log("siglus_hook: original tnm_pack_buffer failed during sync repack");
-        return None;
+        debug_log("siglus_hook: original tnm_pack_buffer failed during async repack");
+        return false;
     }
+    debug_log("siglus_hook: async pack end");
 
     let (packed_start, packed_end, _) = match unsafe { read_byte_array_fields(temp.as_mut_ptr()) } {
         Some(fields) => fields,
         None => {
             debug_log("siglus_hook: failed to read packed temp array fields");
-            return None;
+            return false;
         }
     };
-    let packed_len = packed_end.checked_sub(packed_start)?;
-    let new_save_len = layout.data_offset.checked_add(packed_len)?;
+    let Some(packed_len) = packed_end.checked_sub(packed_start) else {
+        return false;
+    };
+    let Some(new_save_len) = job.layout.data_offset.checked_add(packed_len) else {
+        return false;
+    };
 
-    if !unsafe { replace_save_buffer(write_data, save_start as *const u8, packed_start as *const u8, packed_len, new_save_len, layout) } {
-        debug_log("siglus_hook: failed to replace save buffer after sync repack");
-        return None;
-    }
+    let mut save_array = match unsafe {
+        program_save_array_from_parts(
+            &job.header,
+            packed_start as *const u8,
+            packed_len,
+            new_save_len,
+            job.layout,
+        )
+    } {
+        Some(save_array) => save_array,
+        None => {
+            debug_log("siglus_hook: failed to allocate save array for async save");
+            return false;
+        }
+    };
+
+    let mut cstr = match ProgramCStr::new(&job.file_path) {
+        Some(cstr) => cstr,
+        None => {
+            debug_log("siglus_hook: failed to build CSTR for async save");
+            return false;
+        }
+    };
 
     debug_log(&format!(
-        "siglus_hook: sync repack complete packed_len=0x{:X}/{} new_save_len=0x{:X}/{}",
+        "siglus_hook: async repack complete packed_len=0x{:X}/{} new_save_len=0x{:X}/{}",
         packed_len,
         packed_len,
         new_save_len,
         new_save_len,
     ));
 
-    Some(unsafe { call_original_tnm_save_to_file(file_path, write_data) })
+    IN_ASYNC_SAVE_WORKER.with(|flag| {
+        *flag.borrow_mut() = true;
+    });
+    debug_log("siglus_hook: async save start");
+    let save_result = unsafe {
+        call_original_tnm_save_to_file(cstr.as_mut_ptr(), save_array.as_mut_ptr())
+    };
+    IN_ASYNC_SAVE_WORKER.with(|flag| {
+        *flag.borrow_mut() = false;
+    });
+    debug_log(&format!("siglus_hook: async save end result={save_result}"));
+
+    save_result
+}
+
+unsafe fn program_save_array_from_parts(
+    header: &[u8],
+    packed_start: *const u8,
+    packed_len: usize,
+    new_save_len: usize,
+    layout: SaveLayout,
+) -> Option<ProgramArray> {
+    if header.len() != layout.data_offset || packed_start.is_null() {
+        return None;
+    }
+
+    let mut array = ProgramArray { fields: [0; 3] };
+    let start = unsafe { array_alloc(new_save_len)? };
+    unsafe {
+        std::ptr::copy_nonoverlapping(header.as_ptr(), start, header.len());
+        std::ptr::copy_nonoverlapping(packed_start, start.add(layout.data_offset), packed_len);
+        std::ptr::write_unaligned(
+            start.add(layout.data_size_offset).cast::<u32>(),
+            packed_len as u32,
+        );
+        array_replace_storage(
+            array.as_mut_ptr(),
+            start as u32,
+            new_save_len as u32,
+            new_save_len as u32,
+        );
+    }
+
+    Some(array)
 }
 
 unsafe extern "fastcall" fn detour_tnm_pack_buffer(src: *const c_void) -> bool {
@@ -605,40 +806,6 @@ unsafe fn program_array_from_raw(source: *const u8, len: usize) -> Option<Progra
     }
 }
 
-unsafe fn replace_save_buffer(
-    write_data: *mut c_void,
-    old_save_start: *const u8,
-    packed_start: *const u8,
-    packed_len: usize,
-    new_save_len: usize,
-    layout: SaveLayout,
-) -> bool {
-    if old_save_start.is_null() || packed_start.is_null() {
-        return false;
-    }
-
-    let Some(new_start) = (unsafe { array_alloc(new_save_len) }) else {
-        return false;
-    };
-
-    unsafe {
-        std::ptr::copy_nonoverlapping(old_save_start, new_start, layout.data_offset);
-        std::ptr::copy_nonoverlapping(packed_start, new_start.add(layout.data_offset), packed_len);
-        std::ptr::write_unaligned(
-            new_start.add(layout.data_size_offset).cast::<u32>(),
-            packed_len as u32,
-        );
-        array_replace_storage(
-            write_data,
-            new_start as u32,
-            new_save_len as u32,
-            new_save_len as u32,
-        );
-    }
-
-    true
-}
-
 #[allow(dead_code)]
 unsafe fn read_array_bytes(array: *const c_void) -> Option<Vec<u8>> {
     let (start, end, _) = unsafe { read_byte_array_fields(array)? };
@@ -758,6 +925,27 @@ unsafe fn read_cstr(value: *const c_void) -> String {
     };
 
     format!("{} (len={len} cap={cap})", String::from_utf16_lossy(chars))
+}
+
+unsafe fn read_cstr_plain(value: *const c_void) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+
+    let base = value.cast::<u8>();
+    let len = unsafe { std::ptr::read_unaligned(base.add(16).cast::<u32>()) } as usize;
+
+    let chars = if len <= 7 {
+        unsafe { std::slice::from_raw_parts(base.cast::<u16>(), len) }
+    } else {
+        let heap = unsafe { std::ptr::read_unaligned(base.cast::<*const u16>()) };
+        if heap.is_null() {
+            return None;
+        }
+        unsafe { std::slice::from_raw_parts(heap, len) }
+    };
+
+    Some(String::from_utf16_lossy(chars))
 }
 
 fn save_file_name_from_cstr_log(value: &str) -> Option<&str> {
@@ -980,16 +1168,16 @@ fn file_name_key(path: &Path) -> Option<String> {
 }
 
 fn debug_log(message: &str) {
-    let mut wide: Vec<u16> = message.encode_utf16().collect();
-    wide.push(0);
+    // let mut wide: Vec<u16> = message.encode_utf16().collect();
+    // wide.push(0);
 
-    unsafe {
-        OutputDebugStringW(wide.as_ptr());
-    }
+    // unsafe {
+    //     OutputDebugStringW(wide.as_ptr());
+    // }
 
-    let mut log_path = std::env::temp_dir();
-    log_path.push("siglus_hook.log");
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
-        let _ = writeln!(file, "{message}");
-    }
+    // let mut log_path = std::env::temp_dir();
+    // log_path.push("siglus_hook.log");
+    // if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
+    //     let _ = writeln!(file, "{message}");
+    // }
 }
