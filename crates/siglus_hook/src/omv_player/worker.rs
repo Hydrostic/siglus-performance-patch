@@ -407,7 +407,7 @@ fn queue_packet(worker: &mut Worker, packet: Packet) -> WorkerStep {
 
     match worker.queues.lock() {
         Ok(mut queues) => {
-            queues.current.packets.push_back(packet);
+            queues.current.packets.push_back(&packet);
             for frame in frames {
                 queues.current.frames.push_back(frame);
             }
@@ -429,7 +429,7 @@ fn queue_next_loop_packet(worker: &mut Worker, packet: Packet) -> WorkerStep {
                 queues.next = Some(LoopQueue::new());
             }
             if let Some(next) = &mut queues.next {
-                next.packets.push_back(packet);
+                next.packets.push_back(&packet);
                 for frame in frames {
                     next.frames.push_back(frame);
                 }

@@ -152,7 +152,6 @@ impl Player {
         };
         queues
             .current
-            .frames
             .last_pts_ms()
             .is_some_and(|last_pts_ms| {
                 time_ms > last_pts_ms.saturating_add(FRAME_MATCH_THRESHOLD_MS)

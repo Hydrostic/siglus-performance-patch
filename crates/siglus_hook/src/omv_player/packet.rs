@@ -1,12 +1,10 @@
 use std::collections::VecDeque;
 
-const MAX_PACKET_QUEUE_LEN: usize = 256;
-const MAX_PACKET_QUEUE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PACKET_STATS_LEN: usize = 64;
 
 pub struct PacketQueue {
-    pub packets: VecDeque<Packet>,
-
-    pub cached_bytes: usize,
+    packets: VecDeque<PacketInfo>,
+    retained_bytes: usize,
     pub first_pts_ms: Option<i64>,
     pub last_pts_ms: Option<i64>,
 }
@@ -26,11 +24,17 @@ pub struct Packet {
     pub presentable: bool,
     pub is_keyframe: bool,
 }
+
+struct PacketInfo {
+    size: usize,
+    pts_ms: Option<i64>,
+}
+
 impl PacketQueue {
     pub(crate) fn new() -> Self {
         Self {
             packets: Default::default(),
-            cached_bytes: 0,
+            retained_bytes: 0,
             first_pts_ms: None,
             last_pts_ms: None,
         }
@@ -38,28 +42,35 @@ impl PacketQueue {
 
     pub(crate) fn clear(&mut self) {
         self.packets.clear();
-        self.cached_bytes = 0;
+        self.retained_bytes = 0;
         self.first_pts_ms = None;
         self.last_pts_ms = None;
     }
 
-    pub(crate) fn push_back(&mut self, packet: Packet) {
-        self.cached_bytes += packet.inner.size();
+    pub(crate) fn push_back(&mut self, packet: &Packet) {
+        let info = PacketInfo {
+            size: packet.inner.size(),
+            pts_ms: packet.pts_ms,
+        };
+        self.retained_bytes += info.size;
         if self.first_pts_ms.is_none() {
-            self.first_pts_ms = packet.pts_ms;
+            self.first_pts_ms = info.pts_ms;
         }
-        self.last_pts_ms = packet.pts_ms.or(self.last_pts_ms);
-        self.packets.push_back(packet);
-    }
+        self.last_pts_ms = info.pts_ms.or(self.last_pts_ms);
+        self.packets.push_back(info);
 
-    pub(crate) fn is_full(&self) -> bool {
-        self.packets.len() >= MAX_PACKET_QUEUE_LEN || self.cached_bytes >= MAX_PACKET_QUEUE_BYTES
+        while self.packets.len() > MAX_PACKET_STATS_LEN {
+            if let Some(info) = self.packets.pop_front() {
+                self.retained_bytes = self.retained_bytes.saturating_sub(info.size);
+            }
+        }
+        self.first_pts_ms = self.packets.front().and_then(|info| info.pts_ms);
     }
 
     pub(crate) fn stats(&self) -> PacketQueueStats {
         PacketQueueStats {
             len: self.packets.len(),
-            cached_bytes: self.cached_bytes,
+            cached_bytes: self.retained_bytes,
             first_pts_ms: self.first_pts_ms,
             last_pts_ms: self.last_pts_ms,
         }

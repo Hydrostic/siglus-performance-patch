@@ -94,7 +94,7 @@ impl LoopQueue {
     }
 
     pub(crate) fn is_full(&self) -> bool {
-        self.frames.is_full() || self.packets.is_full()
+        self.frames.is_full()
     }
 
     pub(crate) fn stats(&self) -> LoopQueueStats {
