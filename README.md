@@ -24,6 +24,10 @@ This patch does the following to improve performance:
 
     During autosave, save files are rotated (e.g. `1008.sav -> 1009.sav`). This patch replaces the original implementation with `MoveFileW`.
 
+5. Hook omv player
+
+    The original OMV player is synchronous and often freezes frames. This patch hooks the player into our own implementation, which runs on a separate thread. The new player uses FFmpeg as its backend and comes with several improvements, like using AVX2 for pixel format conversion.
+
 Currently, this project does not include any tools to modify the IAT to make the engine load the DLL automatically.
 
 This project is for studying purposes only. Any other use is prohibited.
