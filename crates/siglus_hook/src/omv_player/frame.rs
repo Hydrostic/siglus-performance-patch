@@ -60,6 +60,10 @@ impl FrameQueue {
         self.frames.len() >= MAX_FRAME_QUEUE_LEN || self.cached_bytes >= MAX_FRAME_QUEUE_BYTES
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.frames.len()
+    }
+
     pub(crate) fn first_pts_ms(&self) -> Option<i64> {
         self.first_pts_ms
     }
@@ -83,29 +87,40 @@ impl FrameQueue {
     }
 
     pub(crate) fn pop_frame_for(&mut self, target_ms: i64, threshold_ms: i64) -> Option<Frame> {
-        while self
-            .frames
-            .front()
-            .is_some_and(|frame| frame_is_before(frame, target_ms, threshold_ms))
-        {
-            self.cached_bytes = self
-                .cached_bytes
-                .saturating_sub(self.frames.front().map_or(0, |frame| frame.inner.len()));
-            self.frames.pop_front();
-        }
-
-        let should_pop = self
-            .frames
-            .front()
-            .is_some_and(|frame| frame_matches(frame, target_ms, threshold_ms));
-        let frame = should_pop.then(|| {
+        let mut candidate = None;
+        while self.frames.front().is_some_and(|frame| {
+            frame_is_not_after_target(frame, target_ms, threshold_ms)
+        }) {
             let frame = self.frames.pop_front().expect("front frame exists");
             self.cached_bytes = self.cached_bytes.saturating_sub(frame.inner.len());
-            frame
-        });
+            if frame.pts_ms.is_some() {
+                candidate = Some(frame);
+            }
+        }
+
         self.first_pts_ms = self.frames.front().and_then(|frame| frame.pts_ms);
         self.last_pts_ms = self.frames.back().and_then(|frame| frame.pts_ms);
-        frame
+        candidate
+    }
+
+    pub(crate) fn trim_to_first_future_frame(&mut self, target_ms: i64, ahead_ms: i64) {
+        if self.frames.len() <= 1 {
+            return;
+        }
+        let Some(first_pts_ms) = self.first_pts_ms else {
+            return;
+        };
+        if first_pts_ms <= target_ms.saturating_add(ahead_ms) {
+            return;
+        }
+
+        while self.frames.len() > 1 {
+            if let Some(frame) = self.frames.pop_back() {
+                self.cached_bytes = self.cached_bytes.saturating_sub(frame.inner.len());
+            }
+        }
+        self.first_pts_ms = self.frames.front().and_then(|frame| frame.pts_ms);
+        self.last_pts_ms = self.frames.back().and_then(|frame| frame.pts_ms);
     }
 }
 
@@ -121,12 +136,11 @@ pub(crate) fn frame_matches(frame: &Frame, target_ms: i64, threshold_ms: i64) ->
                 .saturating_add(threshold_ms)
 }
 
-fn frame_is_before(frame: &Frame, target_ms: i64, threshold_ms: i64) -> bool {
+fn frame_is_not_after_target(frame: &Frame, target_ms: i64, threshold_ms: i64) -> bool {
     let Some(pts_ms) = frame.pts_ms else {
         return true;
     };
-    let duration_ms = frame.duration_ms.unwrap_or(0).max(0);
-    pts_ms.saturating_add(duration_ms) < target_ms.saturating_sub(threshold_ms)
+    pts_ms <= target_ms.saturating_add(threshold_ms)
 }
 
 fn vec32_to_vec8(vec32: Vec<u32>) -> Vec<u8> {
@@ -217,7 +231,7 @@ fn rgba_to_bgra_loop(
     let has_avx2 = CpuId::new()
         .get_extended_feature_info()
         .map_or(false, |finfo| finfo.has_avx2());
-    if has_avx2 {
+    if false {
         for y in 0..alpha_h {
             let alpha_row = &alpha_plane[y * alpha_stride..][..real_width];
             let r_row = &r_plane[y * r_stride..][..real_width];

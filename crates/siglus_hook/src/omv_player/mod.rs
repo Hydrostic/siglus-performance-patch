@@ -11,7 +11,10 @@ mod worker;
 use std::{
     ffi::CString,
     path::PathBuf,
-    sync::{Arc, Mutex, Once, OnceLock},
+    sync::{
+        atomic::AtomicI64,
+        Arc, Mutex, Once, OnceLock,
+    },
 };
 
 use ffmpeg_next::{self as ffmpeg, Rescale};
@@ -188,6 +191,7 @@ impl OmvPlayerInner {
 
         let queues = Arc::new(Mutex::new(LoopQueues::new()));
         let playback_state = Arc::new(Mutex::new(PlaybackState::Playing));
+        let playback_clock_ms = Arc::new(AtomicI64::new(0));
         let loop_config = Arc::new(LoopConfig::new(loop_enabled, duration_ms));
         let demuxer = Demuxer::new(input, stream_index, stream_time_base);
         let decoder = Decoder::new(decoder, stream_time_base, video_info);
@@ -196,12 +200,14 @@ impl OmvPlayerInner {
             demuxer,
             playback_state.clone(),
             queues.clone(),
+            playback_clock_ms.clone(),
             loop_config.clone(),
         )
         .start();
         let player = Player::new(
             loop_config.clone(),
             queues,
+            playback_clock_ms,
             playback_state,
             worker_handle,
             video_info.display_width,

@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc, Mutex,
     },
     thread::JoinHandle,
@@ -25,8 +25,11 @@ pub struct Worker {
     demuxer: Demuxer,
     playback_state: Arc<Mutex<PlaybackState>>,
     queues: Arc<Mutex<LoopQueues>>,
+    playback_clock_ms: Arc<AtomicI64>,
     loop_config: Arc<LoopConfig>,
 }
+
+const MAX_CURRENT_PREFETCH_AHEAD_MS: i64 = 750;
 
 pub enum WorkerCommand {
     Pause,
@@ -46,6 +49,7 @@ impl Worker {
         demuxer: Demuxer,
         playback_state: Arc<Mutex<PlaybackState>>,
         queues: Arc<Mutex<LoopQueues>>,
+        playback_clock_ms: Arc<AtomicI64>,
         loop_config: Arc<LoopConfig>,
     ) -> Self {
         Self {
@@ -53,6 +57,7 @@ impl Worker {
             demuxer,
             playback_state,
             queues,
+            playback_clock_ms,
             loop_config,
         }
     }
@@ -314,6 +319,15 @@ fn target_queue_is_full(worker: &Worker, worker_state: &WorkerState) -> bool {
         .map(|queues| match worker_state {
             WorkerState::Preload(PreloadTarget::NextLoop) => {
                 queues.next.as_ref().is_some_and(LoopQueue::is_full)
+            }
+            WorkerState::Playing
+            | WorkerState::Preload(PreloadTarget::Current)
+            | WorkerState::Seeking(_)
+            | WorkerState::Forwarding(_) => {
+                let clock_ms = worker.playback_clock_ms.load(Ordering::Relaxed);
+                queues.current.frames.last_pts_ms().is_some_and(|last_pts_ms| {
+                    last_pts_ms > clock_ms.saturating_add(MAX_CURRENT_PREFETCH_AHEAD_MS)
+                }) || queues.current.is_full()
             }
             _ => queues.current.is_full(),
         })

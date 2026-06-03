@@ -1,6 +1,9 @@
 use std::{
     ptr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use crate::omv_player::{
@@ -12,11 +15,13 @@ use crate::omv_player::{
 };
 
 const FRAME_MATCH_THRESHOLD_MS: i64 = 10;
+const MAX_CURRENT_PREFETCH_AHEAD_MS: i64 = 750;
 
 pub struct Player {
     clock: Mutex<ClockTracker>,
     loop_config: Arc<LoopConfig>,
     queues: Arc<Mutex<LoopQueues>>,
+    playback_clock_ms: Arc<AtomicI64>,
     last_frame: Mutex<Option<Frame>>,
     playback_state: Arc<Mutex<PlaybackState>>,
     worker_handle: WorkerHandle,
@@ -29,6 +34,7 @@ impl Player {
     pub fn new(
         loop_config: Arc<LoopConfig>,
         queues: Arc<Mutex<LoopQueues>>,
+        playback_clock_ms: Arc<AtomicI64>,
         playback_state: Arc<Mutex<PlaybackState>>,
         worker_handle: WorkerHandle,
         display_width: u32,
@@ -38,6 +44,7 @@ impl Player {
             clock: Mutex::new(ClockTracker::new()),
             loop_config,
             queues,
+            playback_clock_ms,
             last_frame: Mutex::new(None),
             playback_state,
             worker_handle,
@@ -77,7 +84,9 @@ impl Player {
             return false;
         }
 
-        self.chase_to(time_ms.max(0));
+        let time_ms = time_ms.max(0);
+        self.playback_clock_ms.store(time_ms, Ordering::Relaxed);
+        self.chase_to(time_ms);
 
         if update_by_force {
             return true;
@@ -103,6 +112,7 @@ impl Player {
         }
 
         let time_ms = time_ms.max(0);
+        self.playback_clock_ms.store(time_ms, Ordering::Relaxed);
         self.chase_to(time_ms);
 
         let frame = self
@@ -150,20 +160,47 @@ impl Player {
         let Ok(queues) = self.queues.lock() else {
             return false;
         };
-        queues
-            .current
-            .last_pts_ms()
-            .is_some_and(|last_pts_ms| {
-                time_ms > last_pts_ms.saturating_add(FRAME_MATCH_THRESHOLD_MS)
+        let frame_stats = queues.current.frames.stats();
+        if frame_stats.len == 0 {
+            return true;
+        }
+        if frame_stats
+            .first_pts_ms
+            .is_some_and(|first_pts_ms| {
+                first_pts_ms > time_ms.saturating_add(MAX_CURRENT_PREFETCH_AHEAD_MS)
             })
+        {
+            return false;
+        }
+        frame_stats.last_pts_ms.is_none_or(|last_pts_ms| {
+            last_pts_ms < time_ms.saturating_add(MAX_CURRENT_PREFETCH_AHEAD_MS / 2)
+        })
     }
 
     fn pop_frame(&self, time_ms: i64) -> Option<Frame> {
-        let mut queues = self.queues.lock().ok()?;
-        queues
-            .current
-            .frames
-            .pop_frame_for(time_ms, FRAME_MATCH_THRESHOLD_MS)
+        let mut should_seek_back = false;
+        let frame = {
+            let mut queues = self.queues.lock().ok()?;
+            let frame = queues
+                .current
+                .frames
+                .pop_frame_for(time_ms, FRAME_MATCH_THRESHOLD_MS);
+            if frame.is_none() {
+                let frame_stats = queues.current.frames.stats();
+                if frame_stats.first_pts_ms.is_some_and(|first_pts_ms| {
+                    first_pts_ms > time_ms.saturating_add(MAX_CURRENT_PREFETCH_AHEAD_MS)
+                }) {
+                    queues.current.clear();
+                    should_seek_back = true;
+                }
+            }
+            frame
+        };
+
+        if should_seek_back {
+            self.worker_handle.seek(time_ms);
+        }
+        frame
     }
 
     fn copy_frame_to_buffer(
