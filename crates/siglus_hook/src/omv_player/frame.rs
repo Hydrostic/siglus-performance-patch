@@ -231,7 +231,7 @@ fn rgba_to_bgra_loop(
     let has_avx2 = CpuId::new()
         .get_extended_feature_info()
         .map_or(false, |finfo| finfo.has_avx2());
-    if false {
+    if has_avx2 {
         for y in 0..alpha_h {
             let alpha_row = &alpha_plane[y * alpha_stride..][..real_width];
             let r_row = &r_plane[y * r_stride..][..real_width];
@@ -339,6 +339,12 @@ fn convert_fake_rgba_to_bgra(
     let alpha2 = &b_plane[(video_frame.stride(2) * real_height) as usize..];
     let alpha_h = (real_height + 2) / 3;
     let alpha_h_2 = alpha_h * 2;
+    let r_plane_1 = &r_plane[alpha_h * r_stride..];
+    let g_plane_1 = &g_plane[alpha_h * g_stride..];
+    let b_plane_1 = &b_plane[alpha_h * b_stride..];
+    let r_plane_2 = &r_plane[alpha_h_2 * r_stride..];
+    let g_plane_2 = &g_plane[alpha_h_2 * g_stride..];
+    let b_plane_2 = &b_plane[alpha_h_2 * b_stride..];
     unsafe {
         rgba_to_bgra_loop(
             alpha_h,
@@ -358,11 +364,11 @@ fn convert_fake_rgba_to_bgra(
             real_width,
             alpha1,
             g_stride,
-            r_plane,
+            r_plane_1,
             r_stride,
-            g_plane,
+            g_plane_1,
             g_stride,
-            b_plane,
+            b_plane_1,
             b_stride,
             &mut bgra_data[alpha_h * real_width..],
         );
@@ -371,11 +377,11 @@ fn convert_fake_rgba_to_bgra(
             real_width,
             alpha2,
             b_stride,
-            r_plane,
+            r_plane_2,
             r_stride,
-            g_plane,
+            g_plane_2,
             g_stride,
-            b_plane,
+            b_plane_2,
             b_stride,
             &mut bgra_data[alpha_h_2 * real_width..],
         );
