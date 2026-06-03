@@ -1,6 +1,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::omv_player::{frame::FrameQueue, packet::PacketQueue};
+use crate::omv_player::{
+    frame::{FrameQueue, FrameQueueStats},
+    packet::{PacketQueue, PacketQueueStats},
+};
 
 pub struct LoopConfig {
     pub enabled: AtomicBool,
@@ -48,10 +51,29 @@ impl LoopQueues {
             self.current = LoopQueue::new();
         }
     }
+
+    pub(crate) fn stats(&self) -> LoopQueuesStats {
+        LoopQueuesStats {
+            current: self.current.stats(),
+            next: self.next.as_ref().map(LoopQueue::stats),
+        }
+    }
 }
 pub struct LoopQueue {
     pub frames: FrameQueue,
     pub packets: PacketQueue,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LoopQueuesStats {
+    pub current: LoopQueueStats,
+    pub next: Option<LoopQueueStats>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LoopQueueStats {
+    pub frames: FrameQueueStats,
+    pub packets: PacketQueueStats,
 }
 
 impl LoopQueue {
@@ -73,5 +95,12 @@ impl LoopQueue {
 
     pub(crate) fn is_full(&self) -> bool {
         self.frames.is_full() || self.packets.is_full()
+    }
+
+    pub(crate) fn stats(&self) -> LoopQueueStats {
+        LoopQueueStats {
+            frames: self.frames.stats(),
+            packets: self.packets.stats(),
+        }
     }
 }

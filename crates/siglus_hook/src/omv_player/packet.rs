@@ -11,6 +11,14 @@ pub struct PacketQueue {
     pub last_pts_ms: Option<i64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PacketQueueStats {
+    pub len: usize,
+    pub cached_bytes: usize,
+    pub first_pts_ms: Option<i64>,
+    pub last_pts_ms: Option<i64>,
+}
+
 pub struct Packet {
     pub inner: ffmpeg_next::packet::Packet,
     pub pts_ms: Option<i64>,
@@ -46,6 +54,15 @@ impl PacketQueue {
 
     pub(crate) fn is_full(&self) -> bool {
         self.packets.len() >= MAX_PACKET_QUEUE_LEN || self.cached_bytes >= MAX_PACKET_QUEUE_BYTES
+    }
+
+    pub(crate) fn stats(&self) -> PacketQueueStats {
+        PacketQueueStats {
+            len: self.packets.len(),
+            cached_bytes: self.cached_bytes,
+            first_pts_ms: self.first_pts_ms,
+            last_pts_ms: self.last_pts_ms,
+        }
     }
 }
 

@@ -5,8 +5,9 @@ use std::{
 
 use crate::omv_player::{
     clock::{ClockEvent, ClockTracker},
-    frame::{frame_matches, Frame},
+    frame::{Frame, frame_matches},
     looper::{LoopConfig, LoopQueues},
+    overlay::{ENABLE_STATS_WINDOW, OverlayStats, StatsWindow},
     worker::WorkerHandle,
 };
 
@@ -19,6 +20,7 @@ pub struct Player {
     last_frame: Mutex<Option<Frame>>,
     playback_state: Arc<Mutex<PlaybackState>>,
     worker_handle: WorkerHandle,
+    stats_window: StatsWindow,
     display_width: u32,
     display_height: u32,
 }
@@ -39,6 +41,7 @@ impl Player {
             last_frame: Mutex::new(None),
             playback_state,
             worker_handle,
+            stats_window: StatsWindow::new(),
             display_width,
             display_height,
         }
@@ -108,11 +111,15 @@ impl Player {
 
         let Some(frame) = frame else {
             self.clear_buffer(buffer, pitch)?;
+            self.update_stats_window(time_ms, pitch, None, None)?;
             return Ok(false);
         };
 
+        let frame_pts_ms = frame.pts_ms;
+        let frame_duration_ms = frame.duration_ms;
         self.copy_frame_to_buffer(&frame, buffer, pitch)?;
         *self.last_frame.lock().unwrap() = Some(frame);
+        self.update_stats_window(time_ms, pitch, frame_pts_ms, frame_duration_ms)?;
         Ok(true)
     }
 
@@ -214,6 +221,39 @@ impl Player {
         Ok(())
     }
 
+    fn update_stats_window(
+        &self,
+        time_ms: i64,
+        pitch: i32,
+        frame_pts_ms: Option<i64>,
+        frame_duration_ms: Option<i64>,
+    ) -> Result<(), String> {
+        if !ENABLE_STATS_WINDOW {
+            return Ok(());
+        }
+
+        let pitch = usize::try_from(pitch).map_err(|_| format!("invalid pitch={pitch}"))?;
+        let queues = self.queues.lock().ok().map(|queues| queues.stats());
+        let playback_state = self
+            .playback_state
+            .lock()
+            .map(|state| state.as_str())
+            .unwrap_or("locked");
+        let stats = OverlayStats {
+            target_ms: time_ms,
+            playback_state,
+            frame_pts_ms,
+            frame_duration_ms,
+            loop_enabled: self.loop_config.is_enabled(),
+            loop_duration_ms: self.loop_config.loop_duration_ms,
+            pitch,
+            queues,
+        };
+
+        self.stats_window.update(&stats);
+        Ok(())
+    }
+
     fn row_bytes_count(&self) -> Result<usize, String> {
         (self.display_width as usize)
             .checked_mul(4)
@@ -226,4 +266,14 @@ pub enum PlaybackState {
     Playing,
     Paused,
     Ended,
+}
+
+impl PlaybackState {
+    fn as_str(self) -> &'static str {
+        match self {
+            PlaybackState::Playing => "Playing",
+            PlaybackState::Paused => "Paused",
+            PlaybackState::Ended => "Ended",
+        }
+    }
 }

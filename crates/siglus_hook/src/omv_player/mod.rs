@@ -3,6 +3,7 @@ mod decoder;
 mod demuxer;
 mod frame;
 mod looper;
+mod overlay;
 mod packet;
 mod player;
 mod worker;
