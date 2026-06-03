@@ -1,30 +1,33 @@
 #![cfg(windows)]
+// mod movie_player;
+mod omv_types;
+mod omv_player;
+mod omv_hook;
 
-use std::ffi::c_void;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::fs::File;
 use std::io::BufWriter;
 use std::os::windows::fs::MetadataExt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 
-use minhook::{MinHook, MH_STATUS};
-use windows_sys::Win32::Foundation::{
-    SetLastError, BOOL, ERROR_FILE_NOT_FOUND, HINSTANCE, TRUE,
-};
+use minhook::{MH_STATUS, MinHook};
+use windows_sys::Win32::Foundation::{BOOL, ERROR_FILE_NOT_FOUND, HINSTANCE, SetLastError, TRUE};
 #[allow(unused_imports)]
 use windows_sys::Win32::Storage::FileSystem::{
-    CopyFileW, GetFileAttributesW, MoveFileExW, MoveFileW, INVALID_FILE_ATTRIBUTES,
-    MOVEFILE_REPLACE_EXISTING,
+    CopyFileW, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING, MoveFileExW,
+    MoveFileW,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows_sys::Win32::System::LibraryLoader::{
     DisableThreadLibraryCalls, GetModuleFileNameW, GetModuleHandleW,
 };
+use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows_sys::Win32::System::Threading::CreateThread;
 use windows_sys::core::PCWSTR;
@@ -41,6 +44,32 @@ type ArrayReplaceStorageFn = unsafe extern "thiscall" fn(*mut c_void, u32, u32, 
 const TNM_SAVE_TO_FILE_OFFSET: usize = 0x25DE60;
 const TNM_PACK_BUFFER_OFFSET: usize = 0x25E120;
 const TNM_CREATE_PNG_FROM_TEXTURE_AND_SAVE_TO_FILE_OFFSET: usize = 0x2389F0;
+const MOVIE_END_LOOP_PATCH_OFFSET: usize = 0x55C329 - 0x400000;
+const MOVIE_IS_PLAYING_ALT_PATCH_OFFSET: usize = 0x5FB8E9 - 0x400000;
+const MOVIE_IS_PLAYING_ALT_JNZ_PATCH_OFFSET: usize = 0x5FB8FB - 0x400000;
+const MOVIE_IS_PLAYING_PATCH_OFFSET: usize = 0x6035BA - 0x400000;
+const MOVIE_IS_PLAYING_JZ_PATCH_OFFSET: usize = 0x6035CC - 0x400000;
+const MOVIE_SEEK_NOP_PATCH_OFFSET: usize = 0x55C29A - 0x400000;
+const MOVIE_DESTROY_PATCH_OFFSET: usize = 0x6F2523 - 0x400000;
+const MOVIE_RESTRUCT_NEW_PATCH_OFFSET: usize = 0x602DAA - 0x400000;
+const MOVIE_RESTRUCT_NEW_NOP_1_OFFSET: usize = 0x602EC1 - 0x400000;
+const MOVIE_RESTRUCT_NEW_STORE_PATCH_OFFSET: usize = 0x602ECC - 0x400000;
+const MOVIE_RESTRUCT_NEW_NOP_2_OFFSET: usize = 0x602F77 - 0x400000;
+const MOVIE_RESTRUCT_NEW_NOP_3_OFFSET: usize = 0x602F7E - 0x400000;
+const MOVIE_RESTRUCT_INIT_NOP_PRE_OFFSET: usize = 0x602FB9 - 0x400000;
+const MOVIE_RESTRUCT_INIT_NOP_OFFSET: usize = 0x602FBE - 0x400000;
+const MOVIE_RESTRUCT_INIT_CALL_OFFSET: usize = 0x602FC7 - 0x400000;
+const MOVIE_RESTRUCT_LAST_ERROR_CALL_OFFSET: usize = 0x602FDF - 0x400000;
+const MOVIE_RESTRUCT_GET_SIZE_PATCH_OFFSET: usize = 0x60308F - 0x400000;
+const MOVIE_RESTRUCT_GET_SIZE_NOP_OFFSET: usize = 0x6030BE - 0x400000;
+const MOVIE_IS_RGB_PATCH_OFFSET: usize = 0x5FE40D - 0x400000;
+const MOVIE_TOTAL_TIME_PATCH_OFFSET: usize = 0x6033E4 - 0x400000;
+const MOVIE_CHECK_ERROR_NOP_OFFSET: usize = 0x603418 - 0x400000;
+const MOVIE_CHECK_ERROR_PATCH_OFFSET: usize = 0x60341F - 0x400000;
+const MOVIE_CHECK_NEED_UPDATE_PATCH_OFFSET: usize = 0x60342C - 0x400000;
+const MOVIE_FILL_ECX_PATCH_OFFSET: usize = 0x603478 - 0x400000;
+const MOVIE_FILL_FORCE_PATCH_OFFSET: usize = 0x60347D - 0x400000;
+const MOVIE_FILL_BUFFER_PATCH_OFFSET: usize = 0x60348C - 0x400000;
 const ARRAY_ALLOC_OFFSET: usize = 0x131C90;
 const ARRAY_REPLACE_STORAGE_OFFSET: usize = 0x1A4BB0;
 const ASYNC_PACK_THRESHOLD: usize = 50 * 1024;
@@ -241,34 +270,22 @@ unsafe fn install_hooks() -> Result<(), MH_STATUS> {
     ORIGINAL_GET_FILE_ATTRIBUTES_W.store(original_get_file_attributes_w, Ordering::Release);
 
     let original_copy_file_w = unsafe {
-        MinHook::create_hook(
-            CopyFileW as *mut c_void,
-            detour_copy_file_w as *mut c_void,
-        )?
+        MinHook::create_hook(CopyFileW as *mut c_void, detour_copy_file_w as *mut c_void)?
     };
     ORIGINAL_COPY_FILE_W.store(original_copy_file_w, Ordering::Release);
 
     let tnm_save_to_file = unsafe { main_module_offset(TNM_SAVE_TO_FILE_OFFSET)? };
-    let original_tnm_save_to_file = unsafe {
-        MinHook::create_hook(
-            tnm_save_to_file,
-            detour_tnm_save_to_file as *mut c_void,
-        )?
-    };
+    let original_tnm_save_to_file =
+        unsafe { MinHook::create_hook(tnm_save_to_file, detour_tnm_save_to_file as *mut c_void)? };
     ORIGINAL_TNM_SAVE_TO_FILE.store(original_tnm_save_to_file, Ordering::Release);
 
     let tnm_pack_buffer = unsafe { main_module_offset(TNM_PACK_BUFFER_OFFSET)? };
-    let original_tnm_pack_buffer = unsafe {
-        MinHook::create_hook(
-            tnm_pack_buffer,
-            detour_tnm_pack_buffer as *mut c_void,
-        )?
-    };
+    let original_tnm_pack_buffer =
+        unsafe { MinHook::create_hook(tnm_pack_buffer, detour_tnm_pack_buffer as *mut c_void)? };
     ORIGINAL_TNM_PACK_BUFFER.store(original_tnm_pack_buffer, Ordering::Release);
 
-    let create_png = unsafe {
-        main_module_offset(TNM_CREATE_PNG_FROM_TEXTURE_AND_SAVE_TO_FILE_OFFSET)?
-    };
+    let create_png =
+        unsafe { main_module_offset(TNM_CREATE_PNG_FROM_TEXTURE_AND_SAVE_TO_FILE_OFFSET)? };
     let original_create_png = unsafe {
         MinHook::create_hook(
             create_png,
@@ -278,7 +295,393 @@ unsafe fn install_hooks() -> Result<(), MH_STATUS> {
     ORIGINAL_TNM_CREATE_PNG_FROM_TEXTURE_AND_SAVE_TO_FILE
         .store(original_create_png, Ordering::Release);
 
+    unsafe {
+        patch_ecx_eax_call(
+            MOVIE_END_LOOP_PATCH_OFFSET,
+            0x55C331 - 0x55C329 + 1,
+            omv_hook::spp_movie_player_end_loop as *const () as usize,
+        )?;
+        patch_movie_is_playing_alt()?;
+        patch_movie_is_playing_alt_jnz()?;
+        patch_movie_is_playing()?;
+        patch_movie_seek_nop()?;
+        patch_movie_destroy()?;
+        patch_movie_restruct_new()?;
+        patch_movie_restruct_new_followups()?;
+        patch_movie_restruct_init_call()?;
+        patch_movie_restruct_last_error_call()?;
+        patch_movie_restruct_get_size()?;
+        patch_movie_is_rgb()?;
+        patch_movie_total_time()?;
+        patch_movie_check_error()?;
+        patch_movie_check_need_update()?;
+        patch_movie_fill_ecx()?;
+        patch_movie_fill_force()?;
+        patch_movie_fill_buffer()?;
+    }
+
     unsafe { MinHook::enable_all_hooks()? };
+    Ok(())
+}
+
+unsafe fn patch_ecx_eax_call(
+    offset: usize,
+    patch_len: usize,
+    call_target: usize,
+) -> Result<(), MH_STATUS> {
+    if patch_len < 7 {
+        return Err(MH_STATUS::MH_ERROR_MEMORY_ALLOC);
+    }
+
+    let patch_address = unsafe { main_module_offset(offset)? };
+    let call_site = patch_address as usize + 2;
+    let next_instruction = call_site + 5;
+    let relative = (call_target as isize)
+        .checked_sub(next_instruction as isize)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(MH_STATUS::MH_ERROR_MEMORY_ALLOC)?;
+
+    let mut patch = vec![0x90; patch_len];
+    patch[0] = 0x8B;
+    patch[1] = 0xC8;
+    patch[2] = 0xE8;
+    patch[3..7].copy_from_slice(&relative.to_le_bytes());
+    unsafe { write_code_patch(patch_address, &patch) }
+}
+
+unsafe fn patch_movie_is_playing() -> Result<(), MH_STATUS> {
+    let patch_address = unsafe { main_module_offset(MOVIE_IS_PLAYING_PATCH_OFFSET)? };
+    let call_target = omv_hook::spp_movie_player_is_playing as *const () as usize;
+    let call_site_offset = 2usize;
+    let next_instruction = patch_address as usize + call_site_offset + 5;
+    let relative = (call_target as isize)
+        .checked_sub(next_instruction as isize)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(MH_STATUS::MH_ERROR_MEMORY_ALLOC)?;
+
+    let mut patch = vec![0x90; 0x6035CB - 0x6035BA + 1];
+    let code = [
+        0x8B, 0xC8, // mov ecx, eax
+        0xE8, 0, 0, 0, 0, // call spp_movie_player_is_playing
+        0x84, 0xC0, // test al, al
+    ];
+    patch[..code.len()].copy_from_slice(&code);
+    patch[3..7].copy_from_slice(&relative.to_le_bytes());
+    unsafe { write_code_patch(patch_address, &patch)? };
+
+    let jz_address = unsafe { main_module_offset(MOVIE_IS_PLAYING_JZ_PATCH_OFFSET)? };
+    unsafe { write_code_patch(jz_address, &[0x74]) }
+}
+
+unsafe fn patch_movie_is_playing_alt() -> Result<(), MH_STATUS> {
+    let patch_address = unsafe { main_module_offset(MOVIE_IS_PLAYING_ALT_PATCH_OFFSET)? };
+    let call_target = omv_hook::spp_movie_player_is_playing as *const () as usize;
+    let call_site_offset = 2usize;
+    let next_instruction = patch_address as usize + call_site_offset + 5;
+    let relative = (call_target as isize)
+        .checked_sub(next_instruction as isize)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(MH_STATUS::MH_ERROR_MEMORY_ALLOC)?;
+
+    let mut patch = vec![0x90; 0x5FB8FA - 0x5FB8E9 + 1];
+    let code = [
+        0x8B, 0xC8, // mov ecx, eax
+        0xE8, 0, 0, 0, 0, // call spp_movie_player_is_playing
+        0x84, 0xC0, // test al, al
+    ];
+    patch[..code.len()].copy_from_slice(&code);
+    patch[3..7].copy_from_slice(&relative.to_le_bytes());
+    unsafe { write_code_patch(patch_address, &patch) }
+}
+
+unsafe fn patch_movie_is_playing_alt_jnz() -> Result<(), MH_STATUS> {
+    let patch_address = unsafe { main_module_offset(MOVIE_IS_PLAYING_ALT_JNZ_PATCH_OFFSET)? };
+    unsafe { write_code_patch(patch_address, &[0x75]) }
+}
+
+unsafe fn patch_movie_seek_nop() -> Result<(), MH_STATUS> {
+    let patch_address = unsafe { main_module_offset(MOVIE_SEEK_NOP_PATCH_OFFSET)? };
+    let patch = vec![0x90; 0x55C2A8 - 0x55C29A + 1];
+    unsafe { write_code_patch(patch_address, &patch) }
+}
+
+unsafe fn patch_movie_destroy() -> Result<(), MH_STATUS> {
+    let patch_address = unsafe { main_module_offset(MOVIE_DESTROY_PATCH_OFFSET)? };
+    let jump_target = omv_hook::spp_movie_player_destroy as *const () as usize;
+    let next_instruction = patch_address as usize + 5;
+    let relative = (jump_target as isize)
+        .checked_sub(next_instruction as isize)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(MH_STATUS::MH_ERROR_MEMORY_ALLOC)?;
+
+    let mut patch = [0xE9, 0, 0, 0, 0];
+    patch[1..5].copy_from_slice(&relative.to_le_bytes());
+    unsafe { write_code_patch(patch_address, &patch) }
+}
+
+unsafe fn patch_movie_restruct_new() -> Result<(), MH_STATUS> {
+    let patch_address = unsafe { main_module_offset(MOVIE_RESTRUCT_NEW_PATCH_OFFSET)? };
+    let call_target = omv_hook::spp_movie_player_new as *const () as usize;
+    let call_site_offset = 3usize;
+    let next_instruction = patch_address as usize + call_site_offset + 5;
+    let relative = (call_target as isize)
+        .checked_sub(next_instruction as isize)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(MH_STATUS::MH_ERROR_MEMORY_ALLOC)?;
+
+    let mut patch = vec![0x90; 0x602E45 - 0x602DAA + 1];
+    let code = [
+        0x83, 0xC4, 0x04, // add esp, 4
+        0xE8, 0, 0, 0, 0, // call spp_movie_player_new
+        0x8B, 0xF8, // mov edi, eax
+        0x89, 0xBD, 0x60, 0xFF, 0xFF, 0xFF, // mov [ebp-0A0h], edi
+    ];
+    patch[..code.len()].copy_from_slice(&code);
+    patch[4..8].copy_from_slice(&relative.to_le_bytes());
+    unsafe { write_code_patch(patch_address, &patch) }
+}
+
+unsafe fn patch_movie_restruct_new_followups() -> Result<(), MH_STATUS> {
+    let nop_1_address = unsafe { main_module_offset(MOVIE_RESTRUCT_NEW_NOP_1_OFFSET)? };
+    let nop_1 = vec![0x90; 0x602EC7 - 0x602EC1 + 1];
+    unsafe { write_code_patch(nop_1_address, &nop_1)? };
+
+    let store_address = unsafe { main_module_offset(MOVIE_RESTRUCT_NEW_STORE_PATCH_OFFSET)? };
+    let mut store_patch = vec![0x90; 0x602F48 - 0x602ECC + 1];
+    let store_code = [
+        0x8B, 0x95, 0x64, 0xFF, 0xFF, 0xFF, // mov edx, [ebp-9Ch]
+        0x8B, 0x52, 0x04, // mov edx, [edx+4]
+        0x89, 0x55, 0xE4, // mov [ebp-1Ch], edx
+        0x8B, 0x95, 0x5C, 0xFF, 0xFF, 0xFF, // mov edx, [ebp-0A4h]
+        0x33, 0xFF, // xor edi, edi
+        0x8B, 0x85, 0x60, 0xFF, 0xFF, 0xFF, // mov eax, [ebp-0A0h]
+        0x89, 0x82, 0xF0, 0x15, 0x00, 0x00, // mov [edx+15F0h], eax
+        0x8B, 0x82, 0xF4, 0x15, 0x00, 0x00, // mov eax, [edx+15F4h]
+        0x89, 0xBD, 0x60, 0xFF, 0xFF, 0xFF, // mov [ebp-0A0h], edi
+        0x8B, 0x4D, 0xE4, // mov ecx, [ebp-1Ch]
+        0x89, 0x45, 0xE4, // mov [ebp-1Ch], eax
+        0x89, 0x8A, 0xF4, 0x15, 0x00, 0x00, // mov [edx+15F4h], ecx
+    ];
+    store_patch[..store_code.len()].copy_from_slice(&store_code);
+    unsafe { write_code_patch(store_address, &store_patch)? };
+
+    let nop_2_address = unsafe { main_module_offset(MOVIE_RESTRUCT_NEW_NOP_2_OFFSET)? };
+    let nop_2 = vec![0x90; 0x602F79 - 0x602F77 + 1];
+    unsafe { write_code_patch(nop_2_address, &nop_2)? };
+
+    let nop_3_address = unsafe { main_module_offset(MOVIE_RESTRUCT_NEW_NOP_3_OFFSET)? };
+    let nop_3 = vec![0x90; 0x602FA1 - 0x602F7E + 1];
+    unsafe { write_code_patch(nop_3_address, &nop_3) }
+}
+
+unsafe fn patch_movie_restruct_init_call() -> Result<(), MH_STATUS> {
+    let pre_nop_address = unsafe { main_module_offset(MOVIE_RESTRUCT_INIT_NOP_PRE_OFFSET)? };
+    unsafe { write_code_patch(pre_nop_address, &[0x8B, 0xC8])? };
+
+    let nop_address = unsafe { main_module_offset(MOVIE_RESTRUCT_INIT_NOP_OFFSET)? };
+    unsafe { write_code_patch(nop_address, &[0x90])? };
+
+    let patch_address = unsafe { main_module_offset(MOVIE_RESTRUCT_INIT_CALL_OFFSET)? };
+    let call_target = omv_hook::spp_movie_player_init as *const () as usize;
+    let next_instruction = patch_address as usize + 5;
+    let relative = (call_target as isize)
+        .checked_sub(next_instruction as isize)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(MH_STATUS::MH_ERROR_MEMORY_ALLOC)?;
+
+    let mut patch = [0xE8, 0, 0, 0, 0];
+    patch[1..5].copy_from_slice(&relative.to_le_bytes());
+    unsafe { write_code_patch(patch_address, &patch) }
+}
+
+unsafe fn patch_movie_restruct_last_error_call() -> Result<(), MH_STATUS> {
+    let patch_address = unsafe { main_module_offset(MOVIE_RESTRUCT_LAST_ERROR_CALL_OFFSET)? };
+    let call_target = omv_hook::spp_movie_player_get_last_error as *const () as usize;
+    let next_instruction = patch_address as usize + 5;
+    let relative = (call_target as isize)
+        .checked_sub(next_instruction as isize)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(MH_STATUS::MH_ERROR_MEMORY_ALLOC)?;
+
+    let mut patch = [0xE8, 0, 0, 0, 0];
+    patch[1..5].copy_from_slice(&relative.to_le_bytes());
+    unsafe { write_code_patch(patch_address, &patch) }
+}
+
+unsafe fn patch_movie_restruct_get_size() -> Result<(), MH_STATUS> {
+    let patch_address = unsafe { main_module_offset(MOVIE_RESTRUCT_GET_SIZE_PATCH_OFFSET)? };
+    let call_target = omv_hook::spp_movie_player_get_size as *const () as usize;
+    let call_site_offset = 14usize;
+    let next_instruction = patch_address as usize + call_site_offset + 5;
+    let relative = (call_target as isize)
+        .checked_sub(next_instruction as isize)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(MH_STATUS::MH_ERROR_MEMORY_ALLOC)?;
+
+    let mut patch = vec![0x90; 0x6030BA - 0x60308F + 1];
+    let code = [
+        0x8B, 0x8F, 0xF0, 0x15, 0x00, 0x00, // mov ecx, [edi+15F0h]
+        0x8D, 0x45, 0xE0, // lea eax, [ebp-20h]
+        0x50, // push eax
+        0x8D, 0x45, 0xDC, // lea eax, [ebp-24h]
+        0x50, // push eax
+        0xE8, 0, 0, 0, 0, // call spp_movie_player_get_size
+        0x8D, 0x4D, 0xB8, // lea ecx, [ebp-48h]
+    ];
+    patch[..code.len()].copy_from_slice(&code);
+    patch[15..19].copy_from_slice(&relative.to_le_bytes());
+    unsafe { write_code_patch(patch_address, &patch)? };
+
+    let nop_address = unsafe { main_module_offset(MOVIE_RESTRUCT_GET_SIZE_NOP_OFFSET)? };
+    unsafe { write_code_patch(nop_address, &[0x90, 0x90, 0x90]) }
+}
+
+unsafe fn patch_movie_total_time() -> Result<(), MH_STATUS> {
+    let patch_address = unsafe { main_module_offset(MOVIE_TOTAL_TIME_PATCH_OFFSET)? };
+    let call_target = omv_hook::spp_movie_player_total_time_ms as *const () as usize;
+    let call_site_offset = 2usize;
+    let next_instruction = patch_address as usize + call_site_offset + 5;
+    let relative = (call_target as isize)
+        .checked_sub(next_instruction as isize)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(MH_STATUS::MH_ERROR_MEMORY_ALLOC)?;
+
+    let mut patch = vec![0x90; 0x6033EB - 0x6033E4 + 1];
+    let code = [
+        0x8B, 0xC8, // mov ecx, eax
+        0xE8, 0, 0, 0, 0, // call spp_movie_player_total_time_ms
+        0x90, // nop
+    ];
+    patch[..code.len()].copy_from_slice(&code);
+    patch[3..7].copy_from_slice(&relative.to_le_bytes());
+    unsafe { write_code_patch(patch_address, &patch) }
+}
+
+unsafe fn patch_movie_is_rgb() -> Result<(), MH_STATUS> {
+    let patch_address = unsafe { main_module_offset(MOVIE_IS_RGB_PATCH_OFFSET)? };
+    let call_target = omv_hook::spp_movie_player_is_rgb as *const () as usize;
+    let call_site_offset = 3usize;
+    let next_instruction = patch_address as usize + call_site_offset + 5;
+    let relative = (call_target as isize)
+        .checked_sub(next_instruction as isize)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(MH_STATUS::MH_ERROR_MEMORY_ALLOC)?;
+
+    let mut patch = vec![0x90; 0x5FE42B - 0x5FE40D + 1];
+    let code = [
+        0x51, // push ecx
+        0x8B, 0xC8, // mov ecx, eax
+        0xE8, 0, 0, 0, 0, // call spp_movie_player_is_rgb
+        0x59, // pop ecx
+        0x85, 0xC0, // test eax, eax
+    ];
+    patch[..code.len()].copy_from_slice(&code);
+    patch[4..8].copy_from_slice(&relative.to_le_bytes());
+    unsafe { write_code_patch(patch_address, &patch) }
+}
+
+unsafe fn patch_movie_check_error() -> Result<(), MH_STATUS> {
+    let nop_address = unsafe { main_module_offset(MOVIE_CHECK_ERROR_NOP_OFFSET)? };
+    unsafe { write_code_patch(nop_address, &[0x90, 0x90])? };
+
+    let patch_address = unsafe { main_module_offset(MOVIE_CHECK_ERROR_PATCH_OFFSET)? };
+    let call_target = omv_hook::spp_movie_player_check_error as *const () as usize;
+    let next_instruction = patch_address as usize + 5;
+    let relative = (call_target as isize)
+        .checked_sub(next_instruction as isize)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(MH_STATUS::MH_ERROR_MEMORY_ALLOC)?;
+
+    let mut patch = [0xE8, 0, 0, 0, 0];
+    patch[1..5].copy_from_slice(&relative.to_le_bytes());
+    unsafe { write_code_patch(patch_address, &patch) }
+}
+
+unsafe fn patch_movie_check_need_update() -> Result<(), MH_STATUS> {
+    let patch_address = unsafe { main_module_offset(MOVIE_CHECK_NEED_UPDATE_PATCH_OFFSET)? };
+    let call_target = omv_hook::spp_movie_player_check_need_update as *const () as usize;
+    let call_site_offset = 17usize;
+    let next_instruction = patch_address as usize + call_site_offset + 5;
+    let relative = (call_target as isize)
+        .checked_sub(next_instruction as isize)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(MH_STATUS::MH_ERROR_MEMORY_ALLOC)?;
+
+    let mut patch = vec![0x90; 0x603449 - 0x60342C + 1];
+    let code = [
+        0x80, 0x7D, 0xE8, 0x00, // cmp byte ptr [ebp-18h], 0
+        0x0F, 0x95, 0xC0, // setnz al
+        0x0F, 0xB6, 0xC0, // movzx eax, al
+        0x50, // push eax
+        0xFF, 0x75, 0xE4, // push [ebp-1Ch]
+        0x8B, 0x4D, 0xEC, // mov ecx, [ebp-14h]
+        0xE8, 0, 0, 0, 0, // call spp_movie_player_check_need_update
+        0x33, 0xC9, // xor ecx, ecx
+        0x84, 0xC0, // test al, al
+    ];
+    patch[..code.len()].copy_from_slice(&code);
+    patch[18..22].copy_from_slice(&relative.to_le_bytes());
+    unsafe { write_code_patch(patch_address, &patch) }
+}
+
+unsafe fn patch_movie_fill_ecx() -> Result<(), MH_STATUS> {
+    let patch_address = unsafe { main_module_offset(MOVIE_FILL_ECX_PATCH_OFFSET)? };
+    unsafe { write_code_patch(patch_address, &[0x8B, 0xC8]) }
+}
+
+unsafe fn patch_movie_fill_force() -> Result<(), MH_STATUS> {
+    let patch_address = unsafe { main_module_offset(MOVIE_FILL_FORCE_PATCH_OFFSET)? };
+    let mut patch = vec![0x90; 0x603481 - 0x60347D + 1];
+    patch[0] = 0xB0; // mov al, 1
+    patch[1] = 0x01;
+    unsafe { write_code_patch(patch_address, &patch) }
+}
+
+unsafe fn patch_movie_fill_buffer() -> Result<(), MH_STATUS> {
+    let patch_address = unsafe { main_module_offset(MOVIE_FILL_BUFFER_PATCH_OFFSET)? };
+    let call_target = omv_hook::spp_movie_player_fill_buffer as *const () as usize;
+    let call_site_offset = 14usize;
+    let next_instruction = patch_address as usize + call_site_offset + 5;
+    let relative = (call_target as isize)
+        .checked_sub(next_instruction as isize)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(MH_STATUS::MH_ERROR_MEMORY_ALLOC)?;
+
+    let mut patch = vec![0x90; 0x6034C5 - 0x60348C + 1];
+    let code = [
+        0xFF, 0x75, 0xE0, // push [ebp-20h]
+        0xFF, 0x75, 0xDC, // push [ebp-24h]
+        0xFF, 0xB7, 0xF8, 0x15, 0x00, 0x00, // push [edi+15F8h]
+        0x8B, 0xCA, // mov ecx, edx
+        0xE8, 0, 0, 0, 0, // call spp_movie_player_fill_buffer
+    ];
+    patch[..code.len()].copy_from_slice(&code);
+    patch[15..19].copy_from_slice(&relative.to_le_bytes());
+    unsafe { write_code_patch(patch_address, &patch) }
+}
+unsafe fn write_code_patch(address: *mut c_void, bytes: &[u8]) -> Result<(), MH_STATUS> {
+    let mut old_protect = 0;
+    let protect_ok = unsafe {
+        VirtualProtect(
+            address,
+            bytes.len(),
+            PAGE_EXECUTE_READWRITE,
+            &mut old_protect,
+        )
+    };
+    if protect_ok == 0 {
+        return Err(MH_STATUS::MH_ERROR_MEMORY_PROTECT);
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), address.cast::<u8>(), bytes.len());
+    }
+
+    let mut ignored_protect = 0;
+    unsafe {
+        VirtualProtect(address, bytes.len(), old_protect, &mut ignored_protect);
+    }
+
     Ok(())
 }
 
@@ -342,17 +745,14 @@ unsafe fn copy_file_w_hook_body(
     let new = unsafe { pcwstr_to_log_string(new_file_name) };
     debug_log(&format!(
         "siglus_hook: CopyFileW existing=\"{}\" new=\"{}\" fail_if_exists={}",
-        existing,
-        new,
-        fail_if_exists,
+        existing, new, fail_if_exists,
     ));
 
     if should_move_rotated_save_or_png(&existing, &new) {
         if fail_if_exists == 0 {
             debug_log(&format!(
                 "siglus_hook: CopyFileW rewritten to MoveFileExW(REPLACE_EXISTING) existing=\"{}\" new=\"{}\"",
-                existing,
-                new,
+                existing, new,
             ));
             return unsafe {
                 MoveFileExW(existing_file_name, new_file_name, MOVEFILE_REPLACE_EXISTING)
@@ -360,8 +760,7 @@ unsafe fn copy_file_w_hook_body(
         } else {
             debug_log(&format!(
                 "siglus_hook: CopyFileW rewritten to MoveFileW existing=\"{}\" new=\"{}\"",
-                existing,
-                new,
+                existing, new,
             ));
             return unsafe { MoveFileW(existing_file_name, new_file_name) };
         }
@@ -437,10 +836,7 @@ unsafe extern "fastcall" fn detour_tnm_save_to_file(
     }
 }
 
-unsafe fn tnm_save_to_file_hook_body(
-    file_path: *const c_void,
-    write_data: *const c_void,
-) -> bool {
+unsafe fn tnm_save_to_file_hook_body(file_path: *const c_void, write_data: *const c_void) -> bool {
     if IN_ASYNC_SAVE_WORKER.with(|flag| *flag.borrow()) {
         return unsafe { call_original_tnm_save_to_file(file_path, write_data) };
     }
@@ -450,9 +846,8 @@ unsafe fn tnm_save_to_file_hook_body(
     let file_name = save_file_name_from_cstr_log(&file_path_text);
     let save_layout = file_name.as_deref().and_then(save_layout_for_file_name);
     let buffer_len = unsafe { byte_array_len(write_data) };
-    let data_size = save_layout.and_then(|layout| unsafe {
-        read_u32_at(write_data, layout.data_size_offset)
-    });
+    let data_size =
+        save_layout.and_then(|layout| unsafe { read_u32_at(write_data, layout.data_size_offset) });
     let payload_len = save_layout
         .and_then(|layout| buffer_len.and_then(|len| len.checked_sub(layout.data_offset)));
     debug_log(&format!(
@@ -466,7 +861,9 @@ unsafe fn tnm_save_to_file_hook_body(
     ));
 
     if let Some(layout) = save_layout {
-        if let Some(result) = unsafe { try_queue_placeholder_save(file_path, write_data as *mut c_void, layout) } {
+        if let Some(result) =
+            unsafe { try_queue_placeholder_save(file_path, write_data as *mut c_void, layout) }
+        {
             return result;
         }
     }
@@ -519,20 +916,19 @@ unsafe fn try_queue_placeholder_save(
     if raw_end > save_len {
         debug_log(&format!(
             "siglus_hook: placeholder raw range invalid raw_len={} save_len={}",
-            raw_len,
-            save_len,
+            raw_len, save_len,
         ));
         return None;
     }
 
     let raw_ptr = (save_start + raw_start) as *const u8;
     let path = unsafe { read_cstr_plain(file_path)? };
-    let header = unsafe { std::slice::from_raw_parts(save_start as *const u8, layout.data_offset) }.to_vec();
+    let header =
+        unsafe { std::slice::from_raw_parts(save_start as *const u8, layout.data_offset) }.to_vec();
     let raw = unsafe { std::slice::from_raw_parts(raw_ptr, raw_len) }.to_vec();
     debug_log(&format!(
         "siglus_hook: placeholder detected; queue async save kind={} path={} raw_len=0x{raw_len:X}/{raw_len}",
-        layout.kind,
-        path,
+        layout.kind, path,
     ));
 
     queue_async_save(AsyncSaveJob {
@@ -580,9 +976,18 @@ fn queue_async_save(job: AsyncSaveJob) {
     thread::spawn(move || {
         let result = catch_unwind(AssertUnwindSafe(|| unsafe { run_async_save_job(&job) }));
         match result {
-            Ok(true) => debug_log(&format!("siglus_hook: async save complete path={}", job.file_path)),
-            Ok(false) => debug_log(&format!("siglus_hook: async save failed path={}", job.file_path)),
-            Err(_) => debug_log(&format!("siglus_hook: panic in async save path={}", job.file_path)),
+            Ok(true) => debug_log(&format!(
+                "siglus_hook: async save complete path={}",
+                job.file_path
+            )),
+            Ok(false) => debug_log(&format!(
+                "siglus_hook: async save failed path={}",
+                job.file_path
+            )),
+            Err(_) => debug_log(&format!(
+                "siglus_hook: panic in async save path={}",
+                job.file_path
+            )),
         }
 
         if let Some(tasks) = SAVE_TASKS.get() {
@@ -601,7 +1006,10 @@ fn queue_async_save(job: AsyncSaveJob) {
 }
 
 unsafe fn run_async_save_job(job: &AsyncSaveJob) -> bool {
-    debug_log(&format!("siglus_hook: async worker start path={}", job.file_path));
+    debug_log(&format!(
+        "siglus_hook: async worker start path={}",
+        job.file_path
+    ));
 
     let mut temp = match unsafe { program_array_from_raw(job.raw.as_ptr(), job.raw.len()) } {
         Some(temp) => temp,
@@ -663,19 +1071,15 @@ unsafe fn run_async_save_job(job: &AsyncSaveJob) -> bool {
 
     debug_log(&format!(
         "siglus_hook: async repack complete packed_len=0x{:X}/{} new_save_len=0x{:X}/{}",
-        packed_len,
-        packed_len,
-        new_save_len,
-        new_save_len,
+        packed_len, packed_len, new_save_len, new_save_len,
     ));
 
     IN_ASYNC_SAVE_WORKER.with(|flag| {
         *flag.borrow_mut() = true;
     });
     debug_log("siglus_hook: async save start");
-    let save_result = unsafe {
-        call_original_tnm_save_to_file(cstr.as_mut_ptr(), save_array.as_mut_ptr())
-    };
+    let save_result =
+        unsafe { call_original_tnm_save_to_file(cstr.as_mut_ptr(), save_array.as_mut_ptr()) };
     IN_ASYNC_SAVE_WORKER.with(|flag| {
         *flag.borrow_mut() = false;
     });
@@ -729,9 +1133,7 @@ unsafe extern "fastcall" fn detour_tnm_pack_buffer(src: *const c_void) -> bool {
 
 unsafe fn tnm_pack_buffer_hook_body(src: *const c_void) -> bool {
     let len = unsafe { byte_array_len(src) };
-    let async_candidate = len
-        .map(|len| len > ASYNC_PACK_THRESHOLD)
-        .unwrap_or(false);
+    let async_candidate = len.map(|len| len > ASYNC_PACK_THRESHOLD).unwrap_or(false);
     debug_log(&format!(
         "siglus_hook: tnm_pack_buffer src={} raw_len={} async_candidate={}",
         unsafe { dump_byte_array(src) },
@@ -822,16 +1224,14 @@ unsafe extern "fastcall" fn detour_tnm_create_png_from_texture_and_save_to_file(
 ) -> bool {
     match catch_unwind(AssertUnwindSafe(|| unsafe {
         tnm_create_png_from_texture_and_save_to_file_hook_body(
-            file_path,
-            width,
-            height,
-            p_rect,
-            use_alpha,
+            file_path, width, height, p_rect, use_alpha,
         )
     })) {
         Ok(result) => result,
         Err(_) => {
-            debug_log("siglus_hook: panic inside tnm_create_png_from_texture_and_save_to_file hook body");
+            debug_log(
+                "siglus_hook: panic inside tnm_create_png_from_texture_and_save_to_file hook body",
+            );
             true
         }
     }
@@ -866,8 +1266,7 @@ unsafe fn tnm_create_png_from_texture_and_save_to_file_hook_body(
         Err(error) => {
             debug_log(&format!(
                 "siglus_hook: rust png write failed file_path=\"{}\" error={}",
-                file_path_text,
-                error,
+                file_path_text, error,
             ));
             false
         }
@@ -908,8 +1307,7 @@ unsafe fn write_png_from_texture(
     if pitch < source_row_len {
         return Err(format!(
             "pitch too small pitch={} row_len={}",
-            pitch,
-            source_row_len,
+            pitch, source_row_len,
         ));
     }
 
@@ -924,8 +1322,7 @@ unsafe fn write_png_from_texture(
         unsafe { append_bgra_row_as_rgb(row, width, &mut rgb) };
     }
 
-    let file = File::create(&path)
-        .map_err(|error| format!("create {} failed: {error}", path))?;
+    let file = File::create(&path).map_err(|error| format!("create {} failed: {error}", path))?;
     let writer = BufWriter::new(file);
     let mut encoder = png::Encoder::new(writer, width as u32, height as u32);
     encoder.set_color(png::ColorType::Rgb);
@@ -987,8 +1384,7 @@ unsafe fn call_original_tnm_create_png_from_texture_and_save_to_file(
         return false;
     }
 
-    let original: TnmCreatePngFromTextureAndSaveToFileFn =
-        unsafe { std::mem::transmute(original) };
+    let original: TnmCreatePngFromTextureAndSaveToFileFn = unsafe { std::mem::transmute(original) };
     unsafe { original(file_path, width, height, p_rect, use_alpha) }
 }
 
@@ -1005,19 +1401,10 @@ unsafe fn array_alloc(size: usize) -> Option<*mut u8> {
     let alloc = unsafe { main_module_offset(ARRAY_ALLOC_OFFSET).ok()? };
     let alloc: ArrayAllocFn = unsafe { std::mem::transmute(alloc) };
     let ptr = unsafe { alloc(size.try_into().ok()?) };
-    if ptr == 0 {
-        None
-    } else {
-        Some(ptr as *mut u8)
-    }
+    if ptr == 0 { None } else { Some(ptr as *mut u8) }
 }
 
-unsafe fn array_replace_storage(
-    array: *mut c_void,
-    start: u32,
-    size: u32,
-    capacity: u32,
-) -> i32 {
+unsafe fn array_replace_storage(array: *mut c_void, start: u32, size: u32, capacity: u32) -> i32 {
     let replace = unsafe { main_module_offset(ARRAY_REPLACE_STORAGE_OFFSET) }
         .expect("main module must exist for array replace storage");
     let replace: ArrayReplaceStorageFn = unsafe { std::mem::transmute(replace) };
@@ -1032,12 +1419,7 @@ unsafe fn set_program_array_bytes(array: *mut c_void, bytes: &[u8]) -> bool {
 
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), start, bytes.len());
-        array_replace_storage(
-            array,
-            start as u32,
-            bytes.len() as u32,
-            bytes.len() as u32,
-        );
+        array_replace_storage(array, start as u32, bytes.len() as u32, bytes.len() as u32);
     }
 
     true
@@ -1346,7 +1728,8 @@ impl FileAttributeCache {
             }
         };
 
-        let result = self.attributes
+        let result = self
+            .attributes
             .get(&key)
             .copied()
             .map(AttributeLookupResult::Hit)
@@ -1369,7 +1752,6 @@ impl AttributeLookup {
             AttributeLookupResult::ParentNotG00 => None,
         }
     }
-
 }
 
 fn load_file_attribute_cache() {
@@ -1383,17 +1765,22 @@ fn load_file_attribute_cache() {
             ));
         }
         Err(error) => {
-            debug_log(&format!("siglus_hook: failed to cache g00 attributes: {error}"));
+            debug_log(&format!(
+                "siglus_hook: failed to cache g00 attributes: {error}"
+            ));
         }
     }
 }
 
 fn build_file_attribute_cache() -> Result<FileAttributeCache, String> {
-    let exe_path = attached_process_path()
-        .ok_or_else(|| "GetModuleFileNameW(NULL) failed".to_string())?;
-    let exe_dir = exe_path
-        .parent()
-        .ok_or_else(|| format!("attached process path has no parent: {}", exe_path.display()))?;
+    let exe_path =
+        attached_process_path().ok_or_else(|| "GetModuleFileNameW(NULL) failed".to_string())?;
+    let exe_dir = exe_path.parent().ok_or_else(|| {
+        format!(
+            "attached process path has no parent: {}",
+            exe_path.display()
+        )
+    })?;
     let g00_root = exe_dir.join("g00");
     let mut attributes = HashMap::new();
 
@@ -1420,7 +1807,9 @@ fn attached_process_path() -> Option<PathBuf> {
         return None;
     }
 
-    Some(PathBuf::from(String::from_utf16_lossy(&buffer[..len as usize])))
+    Some(PathBuf::from(String::from_utf16_lossy(
+        &buffer[..len as usize],
+    )))
 }
 
 fn collect_file_attributes(

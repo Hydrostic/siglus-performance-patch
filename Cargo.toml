@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/omv_avif_converter",
     "crates/siglus_hook",
     "crates/siglus_injector",
 ]
