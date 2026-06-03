@@ -15,13 +15,16 @@ use windows_sys::Win32::{
         TRANSPARENT, WHITE_BRUSH,
     },
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
-    UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
-        LoadCursorW, PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW,
-        RegisterClassW, SetWindowLongPtrW, ShowWindow, TranslateMessage, CREATESTRUCTW,
-        CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG, PM_NOREMOVE,
-        SW_SHOW, WM_APP, WM_DESTROY, WM_NCCREATE, WM_PAINT, WM_QUIT, WNDCLASSW,
-        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    UI::{
+        Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU, VK_X},
+        WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
+            LoadCursorW, PeekMessageW, PostMessageW, PostQuitMessage, PostThreadMessageW,
+            RegisterClassW, SetWindowLongPtrW, ShowWindow, TranslateMessage, CREATESTRUCTW,
+            CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG, PM_NOREMOVE,
+            SW_HIDE, SW_SHOW, WM_APP, WM_DESTROY, WM_NCCREATE, WM_PAINT, WM_QUIT, WNDCLASSW,
+            WS_OVERLAPPEDWINDOW,
+        },
     },
 };
 
@@ -32,6 +35,7 @@ pub(crate) const ENABLE_STATS_WINDOW: bool = true;
 const WINDOW_CLASS_NAME: &str = "SiglusOmvStatsWindow";
 const WINDOW_TITLE: &str = "OMV Stats";
 const WM_STATS_UPDATED: u32 = WM_APP + 1;
+const WM_STATS_VISIBILITY_CHANGED: u32 = WM_APP + 2;
 
 pub(crate) struct StatsWindow {
     state: Arc<StatsWindowState>,
@@ -54,6 +58,8 @@ struct StatsWindowState {
     hwnd: AtomicIsize,
     thread_id: AtomicU32,
     shutdown: AtomicBool,
+    visible: AtomicBool,
+    hotkey_was_down: AtomicBool,
 }
 
 impl StatsWindow {
@@ -63,6 +69,8 @@ impl StatsWindow {
             hwnd: AtomicIsize::new(0),
             thread_id: AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
+            visible: AtomicBool::new(false),
+            hotkey_was_down: AtomicBool::new(false),
         });
         let thread_state = state.clone();
         let thread = std::thread::Builder::new()
@@ -77,14 +85,36 @@ impl StatsWindow {
     }
 
     pub(crate) fn update(&self, stats: &OverlayStats) {
+        self.update_hotkey();
         if let Ok(mut text) = self.state.text.lock() {
             *text = stats.to_text();
+        }
+
+        if !self.state.visible.load(Ordering::Relaxed) {
+            return;
         }
 
         let hwnd = self.state.hwnd.load(Ordering::Relaxed);
         if hwnd != 0 {
             unsafe {
                 PostMessageW(hwnd as HWND, WM_STATS_UPDATED, 0, 0);
+            }
+        }
+    }
+
+    fn update_hotkey(&self) {
+        let alt_down = key_is_down(VK_MENU);
+        let x_down = key_is_down(VK_X);
+        let hotkey_down = alt_down && x_down;
+        let was_down = self.state.hotkey_was_down.swap(hotkey_down, Ordering::Relaxed);
+        if hotkey_down && !was_down {
+            let visible = !self.state.visible.load(Ordering::Relaxed);
+            self.state.visible.store(visible, Ordering::Relaxed);
+            let hwnd = self.state.hwnd.load(Ordering::Relaxed);
+            if hwnd != 0 {
+                unsafe {
+                    PostMessageW(hwnd as HWND, WM_STATS_VISIBILITY_CHANGED, 0, 0);
+                }
             }
         }
     }
@@ -181,7 +211,7 @@ fn run_window_thread(state: Arc<StatsWindowState>) {
             0,
             class_name.as_ptr(),
             window_title.as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             520,
@@ -198,7 +228,14 @@ fn run_window_thread(state: Arc<StatsWindowState>) {
         }
 
         state.hwnd.store(hwnd as isize, Ordering::Relaxed);
-        ShowWindow(hwnd, SW_SHOW);
+        ShowWindow(
+            hwnd,
+            if state.visible.load(Ordering::Relaxed) {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
         if state.shutdown.load(Ordering::Relaxed) {
             PostMessageW(
                 hwnd,
@@ -232,6 +269,14 @@ unsafe extern "system" fn stats_window_proc(
                 }
             }
             1
+        }
+        WM_STATS_VISIBILITY_CHANGED => {
+            let state = window_state(hwnd);
+            let visible = state.is_some_and(|state| state.visible.load(Ordering::Relaxed));
+            unsafe {
+                ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
+            }
+            0
         }
         WM_STATS_UPDATED => {
             unsafe {
@@ -333,6 +378,10 @@ fn fmt_bytes(value: usize) -> String {
 
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn key_is_down(key: u16) -> bool {
+    unsafe { GetAsyncKeyState(i32::from(key)) & i16::MIN != 0 }
 }
 
 fn rgb(red: u8, green: u8, blue: u8) -> u32 {
