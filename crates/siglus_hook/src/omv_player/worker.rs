@@ -35,7 +35,7 @@ pub enum WorkerCommand {
     Pause,
     Resume,
     // The timer reached the end of the loop segment, so wrap back to the loop start position.
-    Wrap,
+    Wrap(crossbeam::channel::Sender<()>),
     Seek(i64),
     // If the timer is a little ahead of the last frame's pts, skip packets until the
     // decoder catches up. Ignore requests earlier than the last queued pts.
@@ -87,7 +87,14 @@ impl WorkerHandle {
     }
 
     pub fn wrap(&self) {
-        self.send(WorkerCommand::Wrap);
+        let (ack_sender, ack_receiver) = crossbeam::channel::bounded(1);
+        if self
+            .command_sender
+            .send(WorkerCommand::Wrap(ack_sender))
+            .is_ok()
+        {
+            ack_receiver.recv().ok();
+        }
     }
 
     pub fn seek(&self, target_ms: i64) {
@@ -245,8 +252,9 @@ fn handle_command(
                 *worker_state = WorkerState::Playing;
             }
         }
-        WorkerCommand::Wrap => {
+        WorkerCommand::Wrap(ack_sender) => {
             handle_wrap(worker, worker_state);
+            ack_sender.send(()).ok();
         }
         WorkerCommand::Seek(target_ms) => {
             if handle_seek(worker, target_ms) {
