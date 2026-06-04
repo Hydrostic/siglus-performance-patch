@@ -25,6 +25,7 @@ use self::{
     clock::MICROSECOND_RATIONAL,
     decoder::Decoder,
     demuxer::Demuxer,
+    frame::FramePool,
     looper::{LoopConfig, LoopQueues},
     player::{PlaybackState, Player},
     worker::Worker,
@@ -193,8 +194,12 @@ impl OmvPlayerInner {
         let playback_state = Arc::new(Mutex::new(PlaybackState::Playing));
         let playback_clock_ms = Arc::new(AtomicI64::new(0));
         let loop_config = Arc::new(LoopConfig::new(loop_enabled, duration_ms));
+        let frame_pool = FramePool::new(
+            video_info.display_width as usize,
+            video_info.display_height as usize,
+        )?;
         let demuxer = Demuxer::new(input, stream_index, stream_time_base);
-        let decoder = Decoder::new(decoder, stream_time_base, video_info);
+        let decoder = Decoder::new(decoder, stream_time_base, video_info, frame_pool);
         let worker_handle = Worker::new(
             decoder,
             demuxer,

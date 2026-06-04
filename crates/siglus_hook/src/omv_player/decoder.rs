@@ -1,7 +1,7 @@
 use crate::{
     omv_player::{
         clock::MICROSECOND_RATIONAL,
-        frame::{convert_frame_pix_fmt, Frame},
+        frame::{Frame, FramePool, convert_frame_pix_fmt},
         packet::Packet,
     },
     omv_types::OmvVideoInfo,
@@ -12,6 +12,7 @@ pub struct Decoder {
     inner: ffmpeg_next::decoder::Video,
     stream_time_base: ffmpeg_next::Rational,
     video_info: OmvVideoInfo,
+    frame_pool: FramePool,
 }
 
 impl Decoder {
@@ -19,11 +20,13 @@ impl Decoder {
         inner: ffmpeg_next::decoder::Video,
         stream_time_base: ffmpeg_next::Rational,
         video_info: OmvVideoInfo,
+        frame_pool: FramePool,
     ) -> Self {
         Self {
             inner,
             stream_time_base,
             video_info,
+            frame_pool,
         }
     }
 
@@ -71,6 +74,7 @@ impl Decoder {
             self.video_info.format,
             self.video_info.display_height as usize,
             self.video_info.display_width as usize,
+            &self.frame_pool,
         )?;
         Ok(Frame {
             inner: data,

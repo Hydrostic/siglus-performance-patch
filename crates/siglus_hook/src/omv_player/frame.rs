@@ -1,11 +1,17 @@
-use std::{collections::VecDeque, mem};
+use std::{
+    collections::VecDeque,
+    ops::{Deref, DerefMut},
+    sync::{Arc, Mutex},
+};
 
+use bytemuck::{cast_slice, cast_slice_mut};
 use yuv::{YuvPlanarImage, YuvRange, YuvStandardMatrix, yuv444_to_bgra};
 
 use crate::omv_types::OmvVideoFormat;
 
 const MAX_FRAME_QUEUE_LEN: usize = 8;
 const MAX_FRAME_QUEUE_BYTES: usize = 96 * 1024 * 1024;
+const MAX_POOLED_FRAME_BUFFERS: usize = MAX_FRAME_QUEUE_LEN * 2 + 4;
 
 pub struct FrameQueue {
     frames: VecDeque<Frame>,
@@ -23,11 +29,126 @@ pub(crate) struct FrameQueueStats {
     pub next_pts_ms: Option<i64>,
 }
 
-#[derive(Clone)]
 pub struct Frame {
-    pub inner: Vec<u8>,
+    pub inner: PooledFrameBuffer,
     pub pts_ms: Option<i64>,
     pub duration_ms: Option<i64>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FramePool {
+    inner: Arc<FramePoolInner>,
+}
+
+struct FramePoolInner {
+    pixel_count: usize,
+    max_cached: usize,
+    buffers: Mutex<Vec<Vec<u32>>>,
+}
+
+pub struct PooledFrameBuffer {
+    pixels: Option<Vec<u32>>,
+    pool: Arc<FramePoolInner>,
+}
+
+impl FramePool {
+    pub(crate) fn new(width: usize, height: usize) -> Result<Self, String> {
+        let pixel_count = width
+            .checked_mul(height)
+            .ok_or_else(|| "frame pixel count overflow".to_string())?;
+        Ok(Self {
+            inner: Arc::new(FramePoolInner {
+                pixel_count,
+                max_cached: MAX_POOLED_FRAME_BUFFERS,
+                buffers: Mutex::new(Vec::with_capacity(MAX_POOLED_FRAME_BUFFERS)),
+            }),
+        })
+    }
+
+    pub(crate) fn acquire(&self) -> PooledFrameBuffer {
+        let mut pixels = self
+            .inner
+            .buffers
+            .lock()
+            .ok()
+            .and_then(|mut buffers| buffers.pop())
+            .unwrap_or_else(|| Vec::with_capacity(self.inner.pixel_count));
+        pixels.resize(self.inner.pixel_count, 0);
+        PooledFrameBuffer {
+            pixels: Some(pixels),
+            pool: Arc::clone(&self.inner),
+        }
+    }
+
+    #[cfg(test)]
+    fn cached_buffer_count(&self) -> usize {
+        self.inner
+            .buffers
+            .lock()
+            .map(|buffers| buffers.len())
+            .unwrap_or(0)
+    }
+}
+
+impl PooledFrameBuffer {
+    pub(crate) fn len(&self) -> usize {
+        self.pixels().len() * size_of::<u32>()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        cast_slice(self.pixels())
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        cast_slice_mut(self.pixels_mut())
+    }
+
+    pub(crate) fn as_mut_pixels(&mut self) -> &mut [u32] {
+        self.pixels_mut()
+    }
+
+    fn pixels(&self) -> &[u32] {
+        self.pixels
+            .as_ref()
+            .expect("pooled frame buffer is present")
+    }
+
+    fn pixels_mut(&mut self) -> &mut [u32] {
+        self.pixels
+            .as_mut()
+            .expect("pooled frame buffer is present")
+    }
+}
+
+impl Deref for PooledFrameBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl DerefMut for PooledFrameBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
+    }
+}
+
+impl Drop for PooledFrameBuffer {
+    fn drop(&mut self) {
+        let Some(mut pixels) = self.pixels.take() else {
+            return;
+        };
+        if pixels.capacity() < self.pool.pixel_count {
+            return;
+        }
+        pixels.truncate(self.pool.pixel_count);
+        if let Ok(mut buffers) = self.pool.buffers.lock() {
+            if buffers.len() < self.pool.max_cached {
+                buffers.push(pixels);
+            }
+        }
+    }
 }
 
 impl FrameQueue {
@@ -143,25 +264,12 @@ fn frame_is_not_after_target(frame: &Frame, target_ms: i64, threshold_ms: i64) -
     pts_ms <= target_ms.saturating_add(threshold_ms)
 }
 
-fn vec32_to_vec8(vec32: Vec<u32>) -> Vec<u8> {
-    unsafe {
-        let ratio = mem::size_of::<u32>() / mem::size_of::<u8>();
-
-        let length = vec32.len() * ratio;
-        let capacity = vec32.capacity() * ratio;
-        let ptr = vec32.as_ptr() as *const u8;
-
-        // Don't run the destructor for vec32
-        mem::forget(vec32);
-
-        // Construct new Vec
-        Vec::from_raw_parts(ptr as *mut u8, length, capacity)
-    }
-}
-fn convert_yuv444_to_bgra(video_frame: &ffmpeg_next::util::frame::Video) -> Vec<u8> {
+fn convert_yuv444_to_bgra(
+    video_frame: &ffmpeg_next::util::frame::Video,
+    mut bgra_data: PooledFrameBuffer,
+) -> PooledFrameBuffer {
     let width = video_frame.width() as usize;
     let height = video_frame.height() as usize;
-    let mut bgra_data = vec![0u8; width * height * 4];
     let y_plane = video_frame.data(0);
     let u_plane = video_frame.data(1);
     let v_plane = video_frame.data(2);
@@ -177,28 +285,31 @@ fn convert_yuv444_to_bgra(video_frame: &ffmpeg_next::util::frame::Video) -> Vec<
     };
     _ = yuv444_to_bgra(
         &yuv_image,
-        &mut bgra_data,
+        bgra_data.as_mut_slice(),
         (width * 4) as u32,
         YuvRange::Limited,
         YuvStandardMatrix::Bt709,
     );
     bgra_data
 }
-fn convert_fake_rgb_to_bgra(video_frame: &ffmpeg_next::util::frame::Video) -> Vec<u8> {
+fn convert_fake_rgb_to_bgra(
+    video_frame: &ffmpeg_next::util::frame::Video,
+    mut bgra_data: PooledFrameBuffer,
+) -> PooledFrameBuffer {
     let width = video_frame.width() as usize;
     let height = video_frame.height() as usize;
-    let mut bgra_data = vec![0u32; width * height];
     let r_plane = video_frame.data(0);
     let g_plane = video_frame.data(1);
     let b_plane = video_frame.data(2);
     let r_stride = video_frame.stride(0) as usize;
     let g_stride = video_frame.stride(1) as usize;
     let b_stride = video_frame.stride(2) as usize;
+    let bgra_pixels = bgra_data.as_mut_pixels();
     for y in 0..height {
         let r_row = &r_plane[y * r_stride..][..width];
         let g_row = &g_plane[y * g_stride..][..width];
         let b_row = &b_plane[y * b_stride..][..width];
-        let bgra_row = &mut bgra_data[y * width..][..width];
+        let bgra_row = &mut bgra_pixels[y * width..][..width];
         for x in 0..width {
             unsafe {
                 let r = *r_row.get_unchecked(x);
@@ -209,7 +320,7 @@ fn convert_fake_rgb_to_bgra(video_frame: &ffmpeg_next::util::frame::Video) -> Ve
             }
         }
     }
-    vec32_to_vec8(bgra_data)
+    bgra_data
 }
 #[inline]
 #[target_feature(enable = "avx2")]
@@ -326,8 +437,8 @@ fn convert_fake_rgba_to_bgra(
     video_frame: &ffmpeg_next::util::frame::Video,
     real_width: usize,
     real_height: usize,
-) -> Vec<u8> {
-    let mut bgra_data = vec![0u32; real_width * real_height];
+    mut bgra_data: PooledFrameBuffer,
+) -> PooledFrameBuffer {
     let r_plane = video_frame.data(0);
     let g_plane = video_frame.data(1);
     let b_plane = video_frame.data(2);
@@ -345,6 +456,7 @@ fn convert_fake_rgba_to_bgra(
     let r_plane_2 = &r_plane[alpha_h_2 * r_stride..];
     let g_plane_2 = &g_plane[alpha_h_2 * g_stride..];
     let b_plane_2 = &b_plane[alpha_h_2 * b_stride..];
+    let bgra_pixels = bgra_data.as_mut_pixels();
     unsafe {
         rgba_to_bgra_loop(
             alpha_h,
@@ -357,7 +469,7 @@ fn convert_fake_rgba_to_bgra(
             g_stride,
             b_plane,
             b_stride,
-            &mut bgra_data,
+            bgra_pixels,
         );
         rgba_to_bgra_loop(
             alpha_h,
@@ -370,7 +482,7 @@ fn convert_fake_rgba_to_bgra(
             g_stride,
             b_plane_1,
             b_stride,
-            &mut bgra_data[alpha_h * real_width..],
+            &mut bgra_pixels[alpha_h * real_width..],
         );
         rgba_to_bgra_loop(
             real_height - alpha_h_2,
@@ -383,22 +495,59 @@ fn convert_fake_rgba_to_bgra(
             g_stride,
             b_plane_2,
             b_stride,
-            &mut bgra_data[alpha_h_2 * real_width..],
+            &mut bgra_pixels[alpha_h_2 * real_width..],
         );
     }
-    vec32_to_vec8(bgra_data)
+    bgra_data
 }
 pub(crate) fn convert_frame_pix_fmt(
     video_frame: &ffmpeg_next::util::frame::Video,
     real_source_pix_fmt: OmvVideoFormat,
     real_height: usize,
     real_width: usize,
-) -> Result<Vec<u8>, String> {
+    frame_pool: &FramePool,
+) -> Result<PooledFrameBuffer, String> {
+    let bgra_data = frame_pool.acquire();
     let data = match real_source_pix_fmt {
-        OmvVideoFormat::Rgb => convert_fake_rgb_to_bgra(video_frame),
-        OmvVideoFormat::Rgba => convert_fake_rgba_to_bgra(video_frame, real_width, real_height),
-        OmvVideoFormat::Yuv => convert_yuv444_to_bgra(video_frame),
+        OmvVideoFormat::Rgb => convert_fake_rgb_to_bgra(video_frame, bgra_data),
+        OmvVideoFormat::Rgba => {
+            convert_fake_rgba_to_bgra(video_frame, real_width, real_height, bgra_data)
+        }
+        OmvVideoFormat::Yuv => convert_yuv444_to_bgra(video_frame, bgra_data),
         OmvVideoFormat::Unknown => return Err("Unknown real source pixel format".to_string()),
     };
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_pool_reuses_returned_buffer() {
+        let pool = FramePool::new(2, 2).unwrap();
+        let first_ptr = {
+            let mut buffer = pool.acquire();
+            buffer.as_mut_slice().fill(0x7f);
+            buffer.as_slice().as_ptr()
+        };
+
+        assert_eq!(pool.cached_buffer_count(), 1);
+
+        let second = pool.acquire();
+        assert_eq!(second.as_slice().as_ptr(), first_ptr);
+        assert_eq!(second.len(), 16);
+    }
+
+    #[test]
+    fn frame_pool_limits_cached_buffers() {
+        let pool = FramePool::new(1, 1).unwrap();
+        let buffers: Vec<_> = (0..MAX_POOLED_FRAME_BUFFERS + 3)
+            .map(|_| pool.acquire())
+            .collect();
+
+        drop(buffers);
+
+        assert_eq!(pool.cached_buffer_count(), MAX_POOLED_FRAME_BUFFERS);
+    }
 }

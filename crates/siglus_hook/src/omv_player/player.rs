@@ -91,11 +91,10 @@ impl Player {
         if update_by_force {
             return true;
         }
-
-        let Some(last_frame) = self.last_frame.lock().unwrap().as_ref().cloned() else {
-            return true;
-        };
-        !frame_matches(&last_frame, time_ms, FRAME_MATCH_THRESHOLD_MS)
+        match self.last_frame.lock().unwrap().as_ref() {
+            Some(last_frame) => !frame_matches(last_frame, time_ms, FRAME_MATCH_THRESHOLD_MS),
+            None => true,
+        }
     }
 
     pub unsafe fn fill_buffer(
@@ -114,10 +113,11 @@ impl Player {
         let time_ms = time_ms.max(0);
         self.playback_clock_ms.store(time_ms, Ordering::Relaxed);
         self.chase_to(time_ms);
-
-        let frame = self
-            .pop_frame(time_ms)
-            .or_else(|| self.last_frame.lock().unwrap().as_ref().cloned());
+        if let Some(frame) = self.pop_frame(time_ms) {
+            *self.last_frame.lock().unwrap() = Some(frame);
+        }
+        let frame = self.last_frame.lock().unwrap();
+        let frame = frame.as_ref();
 
         let Some(frame) = frame else {
             self.clear_buffer(buffer, pitch)?;
@@ -128,7 +128,6 @@ impl Player {
         let frame_pts_ms = frame.pts_ms;
         let frame_duration_ms = frame.duration_ms;
         self.copy_frame_to_buffer(&frame, buffer, pitch)?;
-        *self.last_frame.lock().unwrap() = Some(frame);
         self.update_stats_window(time_ms, pitch, frame_pts_ms, frame_duration_ms)?;
         Ok(true)
     }
@@ -228,6 +227,7 @@ impl Player {
             ));
         }
 
+        let frame_data = frame.inner.as_slice();
         for y in 0..height {
             let source_start = y
                 .checked_mul(row_bytes)
@@ -238,7 +238,7 @@ impl Player {
             let destination = unsafe { buffer.add(y * pitch) };
             unsafe {
                 ptr::copy_nonoverlapping(
-                    frame.inner[source_start..source_end].as_ptr(),
+                    frame_data[source_start..source_end].as_ptr(),
                     destination,
                     row_bytes,
                 );
