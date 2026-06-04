@@ -13,7 +13,7 @@ use std::io::BufWriter;
 use std::os::windows::fs::MetadataExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 
@@ -93,7 +93,6 @@ static ORIGINAL_TNM_SAVE_TO_FILE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::n
 static ORIGINAL_TNM_PACK_BUFFER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static ORIGINAL_TNM_CREATE_PNG_FROM_TEXTURE_AND_SAVE_TO_FILE: AtomicPtr<c_void> =
     AtomicPtr::new(std::ptr::null_mut());
-static GET_FILE_ATTRIBUTES_W_HITS: AtomicUsize = AtomicUsize::new(0);
 static FILE_ATTRIBUTE_CACHE: OnceLock<Arc<FileAttributeCache>> = OnceLock::new();
 static SAVE_TASKS: OnceLock<Mutex<HashMap<String, Arc<SaveSlot>>>> = OnceLock::new();
 
@@ -749,11 +748,6 @@ unsafe fn write_code_patch(address: *mut c_void, bytes: &[u8]) -> Result<(), MH_
 }
 
 unsafe extern "system" fn detour_get_file_attributes_w(file_name: PCWSTR) -> u32 {
-    let hit = GET_FILE_ATTRIBUTES_W_HITS.fetch_add(1, Ordering::Relaxed);
-    if hit < 20 {
-        debug_log("siglus_hook: GetFileAttributesW hit");
-    }
-
     match catch_unwind(AssertUnwindSafe(|| unsafe {
         get_file_attributes_w_hook_body(file_name)
     })) {
