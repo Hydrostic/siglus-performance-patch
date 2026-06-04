@@ -1857,7 +1857,7 @@ fn build_file_attribute_cache() -> Result<FileAttributeCache, String> {
 }
 
 fn attached_process_path() -> Option<PathBuf> {
-    let mut buffer = [0u16; 32768];
+    let mut buffer = vec![0u16; 32768];
     let len = unsafe {
         GetModuleFileNameW(
             std::ptr::null_mut(),
