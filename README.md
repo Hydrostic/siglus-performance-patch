@@ -40,5 +40,7 @@ This patch does the following to improve performance:
 ### OMV Video Play
 ![spp_benchmark_omv_play](images/spp_benchmark_omv_play.png)
 
+### Chapter Transition (Auto save)
+![spp_benchmark_chapter_transition](images/spp_benchmark_chapter_transition.png)
 
 This project is for studying purposes only. Any other use is prohibited.
