@@ -6,6 +6,7 @@ mod omv_hook;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::env;
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::BufWriter;
@@ -222,6 +223,7 @@ pub extern "system" fn DllMain(
     let _ = catch_unwind(AssertUnwindSafe(|| match call_reason {
         DLL_PROCESS_ATTACH => {
             debug_log("siglus_hook: DLL_PROCESS_ATTACH");
+            prepend_attached_exe_dir_to_path();
             unsafe {
                 DisableThreadLibraryCalls(dll_module);
                 CreateThread(
@@ -238,6 +240,63 @@ pub extern "system" fn DllMain(
     }));
 
     TRUE
+}
+
+fn prepend_attached_exe_dir_to_path() {
+    let exe_path = match attached_process_path() {
+        Some(path) => path,
+        None => {
+            debug_log("siglus_hook: failed to read attached process path for PATH update");
+            return;
+        }
+    };
+    let exe_dir = match exe_path.parent() {
+        Some(path) => path.to_path_buf(),
+        None => {
+            debug_log(&format!(
+                "siglus_hook: attached process path has no parent for PATH update: {}",
+                exe_path.display()
+            ));
+            return;
+        }
+    };
+    let exe_dir_key = path_key_for_env(&exe_dir);
+
+    let mut paths = Vec::with_capacity(1);
+    paths.push(exe_dir.clone());
+
+    if let Some(path_value) = env::var_os("PATH") {
+        paths.extend(
+            env::split_paths(&path_value)
+                .filter(|path| path_key_for_env(path) != exe_dir_key),
+        );
+    }
+
+    let path_value = match env::join_paths(paths) {
+        Ok(value) => value,
+        Err(error) => {
+            debug_log(&format!(
+                "siglus_hook: failed to build PATH with attached EXE directory: {error}"
+            ));
+            return;
+        }
+    };
+
+    unsafe {
+        env::set_var("PATH", path_value);
+    }
+    debug_log(&format!(
+        "siglus_hook: prepended attached EXE directory to PATH: {}",
+        exe_dir.display()
+    ));
+}
+
+fn path_key_for_env(path: &Path) -> String {
+    let mut key = path.to_string_lossy().replace('/', "\\");
+    while key.len() > 3 && key.ends_with('\\') {
+        key.pop();
+    }
+    key.to_ascii_lowercase()
 }
 
 unsafe extern "system" fn install_hooks_thread(_parameter: *mut c_void) -> u32 {
