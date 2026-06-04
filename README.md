@@ -6,6 +6,14 @@ A patch intended to improve the performance of the Siglus engine using hooks.
 
 **PLEASE BACK UP YOUR SAVE DATA BEFORE TRYING IT AND WHILE USING IT. I AM NOT RESPONSIBLE FOR ANY DATA LOSS.**
 
+**CURRENTLY ONLY ANEMOI IS SUPPORTED**
+
+## Usage
+
+Download the zip file from release, and extract all files into game folder. Run `siglus_iat_patcher.exe`, click `Browse` and select SiglusEngine.exe.
+
+## Intro
+
 This patch does the following to improve performance:
 
 1. Hook `GetFileAttributesW`
