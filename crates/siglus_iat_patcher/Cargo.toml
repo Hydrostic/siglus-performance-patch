@@ -1,0 +1,13 @@
+[package]
+name = "siglus_iat_patcher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+windows-sys = { version = "0.59.0", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_WindowsAndMessaging",
+] }

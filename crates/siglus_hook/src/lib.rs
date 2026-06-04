@@ -215,6 +215,10 @@ impl ProgramCStr {
 
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
+pub extern "system" fn SiglusHookLoadAnchor() {}
+
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
 pub extern "system" fn DllMain(
     dll_module: HINSTANCE,
     call_reason: u32,
